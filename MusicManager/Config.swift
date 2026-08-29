@@ -13,4 +13,6 @@ struct Config {
     static let byeTunesApiHost: String = {
         return URL(string: byeTunesApiUrl)?.host ?? ""
     }()
+
+    static let downloadBackendLabel = "Download Server"
 }

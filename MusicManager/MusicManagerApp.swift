@@ -1,6 +1,19 @@
 import SwiftUI
+import BackgroundTasks
 
 final class MusicManagerAppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        BackgroundMetadataFetchManager.shared.registerBackgroundTask()
+        return true
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        BackgroundMetadataFetchManager.shared.scheduleBackgroundProcessing()
+    }
+
     func application(
         _ application: UIApplication,
         handleEventsForBackgroundURLSession identifier: String,

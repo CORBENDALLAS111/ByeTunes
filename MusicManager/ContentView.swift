@@ -239,7 +239,16 @@ struct ContentView: View {
                 }
                 return
             }
-            
+
+            if host.contains("deezer.com") || host.contains("deezer.page.link") {
+                let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+                let showRingtonesTab = (16...18).contains(major)
+                let downloadTabIndex = showRingtonesTab ? 2 : 1
+                self.selectedTab = downloadTabIndex
+                NotificationCenter.default.post(name: NSNotification.Name("IncomingMusicLink"), object: url.absoluteString)
+                return
+            }
+
             handleIncomingFile(url)
         }
         .onChange(of: scenePhase) { newPhase in

@@ -26,7 +26,6 @@ struct MusicView: View {
     @State private var totalImportCount = 0
     @State private var importPhaseTitle = "Importing Songs"
     @State private var pendingDownloadedImportURLs: [URL] = []
-    @State private var isProcessingDownloadedImportQueue = false
     @AppStorage("backgroundDownloadsEnabled") private var backgroundDownloadsEnabled = false
     
     
@@ -711,43 +710,12 @@ struct MusicView: View {
     }
 
     private func processDownloadedImportQueueIfNeeded() {
-        guard !BackgroundMetadataFetchManager.shared.isProcessing else { return }
-        guard !isProcessingDownloadedImportQueue else { return }
-        guard !isImporting else { return }
         guard !pendingDownloadedImportURLs.isEmpty else { return }
-
-        isProcessingDownloadedImportQueue = true
-        Task {
-            while true {
-                let batch = await MainActor.run { () -> [URL] in
-                    guard !pendingDownloadedImportURLs.isEmpty else { return [] }
-                    let urls = pendingDownloadedImportURLs
-                    pendingDownloadedImportURLs.removeAll()
-                    return urls
-                }
-
-                guard !batch.isEmpty else { break }
-                await importSongs(urls: batch, stageInputFiles: false, preserveDownloadedFiles: true)
-
-                let remaining = QueuePersistenceStore.loadPendingDownloadedImports().filter { item in
-                    !batch.contains(where: { $0.path == item.localURLPath })
-                }
-                QueuePersistenceStore.savePendingDownloadedImports(remaining)
-            }
-
-            await MainActor.run {
-                isProcessingDownloadedImportQueue = false
-            }
-        }
+        BackgroundMetadataFetchManager.shared.processPendingDownloadsInBackground()
     }
 
     private func importSongs(urls: [URL], stageInputFiles: Bool, preserveDownloadedFiles: Bool) async {
         guard !urls.isEmpty else { return }
-
-        let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "local"
-        let useiTunes = (metadataSource == "itunes")
-        let autofetch = UserDefaults.standard.bool(forKey: "autofetchMetadata")
-        let fetchLyrics = UserDefaults.standard.bool(forKey: "fetchLyrics")
 
         let stagingDirectory = importStagingDirectory
         var stagedURLs: [URL] = []
@@ -907,28 +875,8 @@ struct MusicView: View {
                 Logger.shared.log("[MusicView] Fallback metadata used for \(localURL.lastPathComponent)")
             }
 
-            if metadataSource == "apple" && autofetch {
-                song = await SongMetadata.enrichWithAppleMusicMetadata(song)
-            } else if useiTunes && autofetch {
-                song = await SongMetadata.enrichWithiTunesMetadata(song)
-            } else if metadataSource == "deezer" && autofetch {
-                song = await SongMetadata.enrichWithDeezerMetadata(song)
-            } else if metadataSource == "local" && autofetch {
-                if UserDefaults.standard.bool(forKey: "appleRichMetadata") {
-                    song = await SongMetadata.matchAppleMusicMetadata(song)
-                }
-            }
-
-            let appleSubscriptionLyrics = UserDefaults.standard.bool(forKey: "appleSubscriptionLyrics")
-            if fetchLyrics && !appleSubscriptionLyrics && (song.lyrics == nil || song.lyrics?.isEmpty == true) {
-                if let fetchedLyrics = await SongMetadata.fetchLyrics(
-                    title: song.title,
-                    artist: song.artist,
-                    album: song.album,
-                    durationMs: song.durationMs
-                ) {
-                    song.lyrics = fetchedLyrics
-                }
+            if !UserDefaults.standard.bool(forKey: "keepLocalMetadataForLocalFiles") {
+                song = await SongMetadata.enrichDownloadedSong(song)
             }
 
             return persistDownloadedSongIfNeeded(song)

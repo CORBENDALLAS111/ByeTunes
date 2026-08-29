@@ -36,6 +36,7 @@ struct ManageBackupsView: View {
     @State private var pendingRestoreExistingPid: Int64? = nil
     @State private var pendingRestoreMissingCount = 0
     @State private var pendingRestoreTotalCount = 0
+    @State private var pendingRestoreMissingSongs: [String] = []
 
     @State private var toastTitle = ""
     @State private var toastIcon = ""
@@ -425,7 +426,10 @@ struct ManageBackupsView: View {
                 Text("Ready to restore '\(pendingRestorePlaylistName)' with all \(pendingRestoreTotalCount) tracks.")
             } else {
                 let matched = pendingRestoreTotalCount - pendingRestoreMissingCount
-                Text("Matched \(matched) out of \(pendingRestoreTotalCount) tracks. \(pendingRestoreMissingCount) tracks are missing from your device library and won't be restored.")
+                let shown = pendingRestoreMissingSongs.prefix(5).joined(separator: "\n")
+                let extra = pendingRestoreMissingSongs.count - min(5, pendingRestoreMissingSongs.count)
+                let extraLine = extra > 0 ? "\n+\(extra) more" : ""
+                Text("Matched \(matched) out of \(pendingRestoreTotalCount) tracks. \(pendingRestoreMissingCount) track\(pendingRestoreMissingCount == 1 ? "" : "s") couldn't be matched and won't be restored:\n\(shown)\(extraLine)")
             }
         }
         .overlay {
@@ -800,7 +804,8 @@ struct ManageBackupsView: View {
             
             var matchedPids: [Int64] = []
             var missingSongsCount = 0
-            
+            var missingSongLabels: [String] = []
+
             for parsedSong in parsedSongs {
                 var match = deviceSongs.first { song in
                     !song.remoteFilename.isEmpty && !parsedSong.remoteFilename.isEmpty &&
@@ -851,16 +856,20 @@ struct ManageBackupsView: View {
                     matchedPids.append(match.itemPid)
                 } else {
                     missingSongsCount += 1
+                    let title = parsedSong.title.isEmpty ? (parsedSong.altTitle ?? "Unknown Title") : parsedSong.title
+                    let artist = parsedSong.artist.isEmpty ? (parsedSong.altArtist ?? "") : parsedSong.artist
+                    missingSongLabels.append(artist.isEmpty ? title : "\(title) — \(artist)")
                 }
             }
-            
+
             let existingPlaylist = existingPlaylists.first { $0.name.lowercased() == playlistName.lowercased() }
-            
+
             self.pendingRestorePlaylistName = playlistName
             self.pendingRestoreSongPids = matchedPids
             self.pendingRestoreExistingPid = existingPlaylist?.pid
             self.pendingRestoreMissingCount = missingSongsCount
             self.pendingRestoreTotalCount = parsedSongs.count
+            self.pendingRestoreMissingSongs = missingSongLabels
             
             DispatchQueue.main.async {
                 self.showingRestoreConfirmationAlert = true

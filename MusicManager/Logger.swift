@@ -4,11 +4,11 @@ import Combine
 
 class Logger: ObservableObject {
     static let shared = Logger()
-    
+
     @Published var logs: String = ""
     private var dateFormatter: DateFormatter
-    
-    
+
+
     private let logQueue = DispatchQueue(label: "com.edualexxis.MusicManager.logger")
 
     private let suppressedSubstrings: [String] = [
@@ -40,10 +40,10 @@ class Logger: ObservableObject {
         "[Download] Failed to map Apple Music track",
         "[Download] Mapped Apple Music source URL",
         "[Download] Using source URL",
-        "[Download] ByeTunes Spotify fallback:",
+        "[Download] Spotify fallback:",
         "[Download] Song.link Deezer mapping failed",
         "[Download] Mapped track to Deezer",
-        "[Download] Requesting ByeTunes API",
+        "[Download] Requesting \(Config.downloadBackendLabel)",
         "[Download] Album search fell back",
         "[Download] Playlist search is using",
         "[Download] Attempting last-resort Spotify mapping",
@@ -89,7 +89,7 @@ class Logger: ObservableObject {
         "[MusicView] Using import chunk size:",
         "[MusicView] Large import detected."
     ]
-    
+
     private init() {
         dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "HH:mm:ss.SSS"
@@ -97,16 +97,16 @@ class Logger: ObservableObject {
         log("Logger Initialized")
         log("===========================================")
     }
-    
+
     func log(_ message: String) {
         guard shouldLog(message) else { return }
         let timestamp = dateFormatter.string(from: Date())
         let formattedMessage = "[\(timestamp)] \(message)"
-        
-        
+
+
         print(formattedMessage)
-        
-        
+
+
         logQueue.async {
             DispatchQueue.main.async {
                 self.logs.append(formattedMessage + "\n")
@@ -120,7 +120,7 @@ class Logger: ObservableObject {
         }
         return true
     }
-    
+
     func clear() {
         logQueue.async {
             DispatchQueue.main.async {
@@ -128,13 +128,13 @@ class Logger: ObservableObject {
             }
         }
     }
-    
+
     func saveLogs() -> URL? {
         let fileManager = FileManager.default
         let logsDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Logs", isDirectory: true)
         let fileURL = logsDirectory.appendingPathComponent("MusicManager_Logs.txt")
-        
+
         do {
             if !fileManager.fileExists(atPath: logsDirectory.path) {
                 try fileManager.createDirectory(at: logsDirectory, withIntermediateDirectories: true)

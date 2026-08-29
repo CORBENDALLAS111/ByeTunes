@@ -22,11 +22,12 @@ struct DeviceLibraryBrowserView: View {
         var id: String { name }
     }
 
-    private struct AlbumEntry: Identifiable {
+    struct AlbumEntry: Identifiable {
         let name: String
         let artist: String
+        let albumPid: Int64
         let songs: [DeviceManager.ExportableSongInfo]
-        var id: String { "\(artist)|\(name)" }
+        var id: String { albumPid > 0 ? "pid:\(albumPid)" : "\(artist)|\(name)" }
     }
     
     struct PlaylistEntry: Identifiable {
@@ -41,19 +42,33 @@ struct DeviceLibraryBrowserView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var songs: [DeviceManager.ExportableSongInfo] = []
+    // Cached results of the grouping/sorting passes below. These are expensive (full-library
+    // Dictionary grouping + sort + Unicode folding), so they're recomputed only when the real
+    // inputs (songs, searchText) change via recomputeLibraryGroupings() — not on every SwiftUI
+    // body evaluation, which otherwise happens constantly during scrolling as artwork thumbnails
+    // load in and mutate unrelated @State.
+    @State private var cachedGroupedSongs: [(key: String, songs: [DeviceManager.ExportableSongInfo])] = []
+    @State private var cachedArtistEntries: [ArtistEntry] = []
+    @State private var cachedAlbumEntries: [AlbumEntry] = []
     @State private var playlists: [PlaylistEntry] = []
     @State private var isSyncingPlaylists = false
     @State private var showingNewPlaylistPrompt = false
     @State private var showingAddToPlaylistSheet = false
     @State private var newPlaylistName = ""
+    @State private var showingRenamePlaylistPrompt = false
+    @State private var renamePlaylistPid: Int64? = nil
+    @State private var renamePlaylistText = ""
     @State private var searchText = ""
     @State private var selectedIDs = Set<String>()
     @State private var isSelectionMode = false
+    @State private var selectedPlaylistPids = Set<Int64>()
+    @State private var showingDeletePlaylistsConfirm = false
     @State private var isLoading = true
     @State private var isExporting = false
     @State private var statusMessage = ""
     @State private var showingFolderPicker = false
     @State private var pendingExportAfterFolderSelection = false
+    @State private var pendingPlaylistExportAfterFolderSelection = false
     @State private var artworkImages: [String: UIImage] = [:]
     @State private var artworkDataCache: [String: Data] = [:]
     @State private var artworkLoadingIDs = Set<String>()
@@ -75,6 +90,12 @@ struct DeviceLibraryBrowserView: View {
     )
     @State private var showingMetadataEditor = false
     @State private var songPendingDeletion: DeviceManager.ExportableSongInfo?
+    @State private var songForQualityAnalysis: DeviceManager.ExportableSongInfo?
+    @State private var songForAudioReplace: DeviceManager.ExportableSongInfo?
+    @State private var editingAlbum: AlbumEntry?
+    @State private var addingSongsToAlbum: AlbumEntry?
+    @State private var showingAddToAlbumSheet = false
+    @State private var isApplyingAlbumEdit = false
 
     private let maxConcurrentArtworkLoads = 2
 
@@ -109,11 +130,7 @@ struct DeviceLibraryBrowserView: View {
         Self.resolveBookmarkedFolder(forKey: Self.exportFolderBookmarkKey)
     }
 
-    private var preferredExportFolderName: String {
-        preferredExportFolder?.lastPathComponent ?? "Not Set"
-    }
-
-    private var groupedSongs: [(key: String, songs: [DeviceManager.ExportableSongInfo])] {
+    private func computeGroupedSongs() -> [(key: String, songs: [DeviceManager.ExportableSongInfo])] {
         let grouped = Dictionary(grouping: filteredSongs) { song in
             let first = song.title
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -134,21 +151,55 @@ struct DeviceLibraryBrowserView: View {
             }
     }
 
-    private var artistEntries: [ArtistEntry] {
-        Dictionary(grouping: filteredSongs) { song in
-            song.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown Artist" : song.artist
-        }
-        .map { key, value in
-            ArtistEntry(
-                name: key,
-                songs: value.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-            )
-        }
-        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    // Splits a collab credit like "Alex Rose & Casper Magico" into ["Alex Rose", "Casper Magico"]
+    // so each performer gets their own Artists row instead of one row per unique credit string.
+    // This intentionally causes the same song to show up under every artist it credits.
+    private static let artistSplitRegex = try! NSRegularExpression(
+        pattern: #"\s*(?:,|&|/|\bfeat\.?|\bft\.?|\bfeaturing\b|\bvs\.?|\bx\b|\by\b)\s*"#,
+        options: [.caseInsensitive]
+    )
+
+    private static func splitArtistNames(_ raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let range = NSRange(trimmed.startIndex..., in: trimmed)
+        let normalized = artistSplitRegex.stringByReplacingMatches(in: trimmed, options: [], range: range, withTemplate: "\u{1}")
+        return normalized
+            .components(separatedBy: "\u{1}")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
-    private var albumEntries: [AlbumEntry] {
-        Dictionary(grouping: filteredSongs) { song in
+    private func computeArtistEntries() -> [ArtistEntry] {
+        var songsByArtist: [String: [DeviceManager.ExportableSongInfo]] = [:]
+
+        for song in filteredSongs {
+            let names = Self.splitArtistNames(song.artist)
+            for name in names.isEmpty ? ["Unknown Artist"] : names {
+                songsByArtist[name, default: []].append(song)
+            }
+        }
+
+        return songsByArtist
+            .map { key, value in
+                ArtistEntry(
+                    name: key,
+                    songs: value.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func computeAlbumEntries() -> [AlbumEntry] {
+        Dictionary(grouping: filteredSongs) { song -> String in
+            // Group by the device's own album_pid so tracks with different individual
+            // (e.g. collab) credits still land in the same album, matching how Apple's
+            // Music app groups them. Only falls back to a name/artist key for legacy rows
+            // that somehow lack an album_pid link.
+            if song.albumPid > 0 {
+                return "pid:\(song.albumPid)"
+            }
             let album = song.album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown Album" : song.album
             let artist = song.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown Artist" : song.artist
             return "\(artist)|\(album)"
@@ -158,6 +209,7 @@ struct DeviceLibraryBrowserView: View {
             return AlbumEntry(
                 name: first.album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown Album" : first.album,
                 artist: first.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown Artist" : first.artist,
+                albumPid: first.albumPid,
                 songs: value.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
             )
         }
@@ -175,25 +227,30 @@ struct DeviceLibraryBrowserView: View {
                 pageBackground
                     .ignoresSafeArea()
 
-                ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: 22) {
                         topBar
 
-                        headerSection
-
                         controlsSection
-
-                        if isLoading {
-                            loadingState
-                        } else if songs.isEmpty {
-                            emptyState
-                        } else {
-                            songsSection
-                        }
                     }
                     .padding(.horizontal, 22)
                     .padding(.top, 12)
-                    .padding(.bottom, 120)
+                    .padding(.bottom, 12)
+                    .background(pageBackground)
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            if isLoading {
+                                loadingState
+                            } else if songs.isEmpty {
+                                emptyState
+                            } else {
+                                songsSection
+                            }
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.bottom, 120)
+                    }
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -215,6 +272,16 @@ struct DeviceLibraryBrowserView: View {
                 applyMetadataEdits(updatedSong, original: original)
             }
         }
+        .sheet(item: $songForQualityAnalysis) { song in
+            AudioQualityAnalysisView(manager: manager, song: song, artwork: artworkImages[song.id])
+        }
+        .sheet(item: $songForAudioReplace) { song in
+            DocumentPicker(types: MusicView.supportedAudioTypes.filter { $0 != .folder }) { url in
+                if let url {
+                    replaceSongAudioFile(song, with: url)
+                }
+            }
+        }
         .sheet(isPresented: $showingAddToPlaylistSheet) {
             AddToPlaylistView(
                 playlists: playlists,
@@ -224,6 +291,79 @@ struct DeviceLibraryBrowserView: View {
                         .addSongs(containerPid: playlistPid, itemPids: selectedSongs.map(\.itemPid))
                     ]
                     applyPlaylistActions(actions)
+                    isSelectionMode = false
+                    selectedIDs.removeAll()
+                }
+            )
+            .presentationDetents([.medium, .large])
+        }
+        .sheet(item: $editingAlbum) { album in
+            AlbumMetadataEditor(
+                album: album,
+                initialArtworkData: album.songs.first.flatMap { artworkDataCache[$0.id] },
+                isPresented: Binding(
+                    get: { editingAlbum != nil },
+                    set: { if !$0 { editingAlbum = nil } }
+                )
+            ) { artist, albumName, genre, year, artworkData, explicitRating in
+                applyAlbumMetadataEdits(
+                    to: album.songs,
+                    artist: artist,
+                    album: albumName,
+                    genre: genre,
+                    year: year,
+                    artworkData: artworkData,
+                    explicitRating: explicitRating
+                )
+            }
+        }
+        .sheet(item: $addingSongsToAlbum) { album in
+            let candidateSongs = songs.filter { candidate in !album.songs.contains(where: { $0.id == candidate.id }) }
+            AddSongsToAlbumSheet(
+                album: album,
+                candidateSongs: candidateSongs,
+                suggestedSongs: suggestedSongs(for: album, in: candidateSongs)
+            ) { selectedSongs in
+                applyAlbumMetadataEdits(
+                    to: selectedSongs,
+                    artist: album.artist,
+                    album: album.name,
+                    genre: album.songs.first?.genre ?? "",
+                    year: album.songs.first(where: { $0.year > 0 })?.year ?? 0,
+                    artworkData: album.songs.first.flatMap { artworkDataCache[$0.id] },
+                    explicitRating: nil
+                )
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showingAddToAlbumSheet) {
+            AddToAlbumView(
+                albums: cachedAlbumEntries,
+                onSelectAlbum: { album in
+                    let selectedSongs = songs.filter { selectedIDs.contains($0.id) }
+                    applyAlbumMetadataEdits(
+                        to: selectedSongs,
+                        artist: album.artist,
+                        album: album.name,
+                        genre: album.songs.first?.genre ?? "",
+                        year: album.songs.first(where: { $0.year > 0 })?.year ?? 0,
+                        artworkData: album.songs.first.flatMap { artworkDataCache[$0.id] },
+                        explicitRating: nil
+                    )
+                    isSelectionMode = false
+                    selectedIDs.removeAll()
+                },
+                onCreateNewAlbum: { artist, albumName, genre, year in
+                    let selectedSongs = songs.filter { selectedIDs.contains($0.id) }
+                    applyAlbumMetadataEdits(
+                        to: selectedSongs,
+                        artist: artist,
+                        album: albumName,
+                        genre: genre,
+                        year: year,
+                        artworkData: nil,
+                        explicitRating: nil
+                    )
                     isSelectionMode = false
                     selectedIDs.removeAll()
                 }
@@ -245,11 +385,22 @@ struct DeviceLibraryBrowserView: View {
         } message: {
             Text(songPendingDeletion.map { "Delete \($0.title) from the device library?" } ?? "")
         }
+        .alert("Delete Playlists?", isPresented: $showingDeletePlaylistsConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteSelectedPlaylists()
+            }
+        } message: {
+            Text("Delete \(selectedPlaylistPids.count) playlist\(selectedPlaylistPids.count == 1 ? "" : "s") from the device? The songs themselves won't be removed.")
+        }
         .onAppear {
             refreshSongs()
         }
         .onChange(of: libraryMode) { _ in
             prefetchArtworkForCurrentMode()
+        }
+        .onChange(of: searchText) { _ in
+            recomputeLibraryGroupings()
         }
     }
 
@@ -274,105 +425,116 @@ struct DeviceLibraryBrowserView: View {
         }
     }
 
-    private var headerSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(libraryMode.rawValue)
-                .font(.system(size: 46, weight: .bold, design: .default))
-                .foregroundStyle(strongTextColor)
-
-            HStack(alignment: .firstTextBaseline) {
-                Text("\(songs.count) on device")
-                    .font(.subheadline)
-                    .foregroundStyle(mutedTextColor)
-
-                Spacer()
-
-                if selectedIDs.isEmpty || !isSelectionMode {
-                    Text(preferredExportFolderName)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(mutedTextColor)
-                        .lineLimit(1)
-                } else {
-                    Text("\(selectedIDs.count) selected")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
-                }
-            }
-        }
-    }
-
     private var controlsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             libraryModeSwitcher
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    actionCapsule(
-                        title: isSelectionMode ? "Done" : "Select",
-                        systemImage: "checklist",
-                        isPrimary: false,
-                        isDisabled: isLoading || filteredSongs.isEmpty || isExporting
-                    ) {
-                        if isSelectionMode {
-                            isSelectionMode = false
-                        } else {
-                            isSelectionMode = true
-                        }
-                    }
-
-                    actionCapsule(
-                        title: isSelectionMode ? (allFilteredSongsSelected ? "Clear All" : "Select All") : "Folder",
-                        systemImage: isSelectionMode ? (allFilteredSongsSelected ? "checkmark.circle.fill" : "checklist") : "folder",
-                        isPrimary: false,
-                        isDisabled: isExporting || (isSelectionMode && filteredSongs.isEmpty)
-                    ) {
-                        if isSelectionMode {
-                            toggleVisibleSelection()
-                        } else {
-                            pendingExportAfterFolderSelection = false
-                            showingFolderPicker = true
-                        }
-                    }
-                    
-                    if isSelectionMode {
+            if libraryMode == .playlists {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
                         actionCapsule(
-                            title: "Add to Playlist",
-                            systemImage: "text.badge.plus",
+                            title: isSelectionMode ? "Done" : "Select",
+                            systemImage: "checklist",
                             isPrimary: false,
-                            isDisabled: selectedIDs.isEmpty || playlists.isEmpty
+                            isDisabled: isLoading || playlists.isEmpty
                         ) {
-                            showingAddToPlaylistSheet = true
+                            isSelectionMode.toggle()
+                            if !isSelectionMode { selectedPlaylistPids.removeAll() }
+                        }
+
+                        if isSelectionMode {
+                            actionCapsule(
+                                title: allPlaylistsSelected ? "Clear All" : "Select All",
+                                systemImage: allPlaylistsSelected ? "checkmark.circle.fill" : "checklist",
+                                isPrimary: false,
+                                isDisabled: playlists.isEmpty
+                            ) {
+                                toggleAllPlaylistsSelection()
+                            }
+
+                            actionCapsule(
+                                title: isExporting ? "Exporting..." : "Export",
+                                systemImage: "square.and.arrow.up",
+                                isPrimary: false,
+                                isDisabled: selectedPlaylistPids.isEmpty || isLoading || isExporting
+                            ) {
+                                exportSelectedPlaylists()
+                            }
+
+                            actionCapsule(
+                                title: "Delete",
+                                systemImage: "trash",
+                                isPrimary: false,
+                                isDestructive: true,
+                                isDisabled: selectedPlaylistPids.isEmpty
+                            ) {
+                                showingDeletePlaylistsConfirm = true
+                            }
                         }
                     }
+                    .padding(.horizontal, 2)
+                }
+            } else if libraryMode == .songs {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        actionCapsule(
+                            title: isSelectionMode ? "Done" : "Select",
+                            systemImage: "checklist",
+                            isPrimary: false,
+                            isDisabled: isLoading || filteredSongs.isEmpty || isExporting
+                        ) {
+                            if isSelectionMode {
+                                isSelectionMode = false
+                            } else {
+                                isSelectionMode = true
+                            }
+                        }
 
-                    actionCapsule(
-                        title: isExporting ? "Exporting..." : "Export",
-                        systemImage: "square.and.arrow.up",
-                        isPrimary: false,
-                        isDisabled: selectedIDs.isEmpty || isLoading || isExporting
-                    ) {
-                        exportSelectedSongs()
+                        actionCapsule(
+                            title: isSelectionMode ? (allFilteredSongsSelected ? "Clear All" : "Select All") : "Folder",
+                            systemImage: isSelectionMode ? (allFilteredSongsSelected ? "checkmark.circle.fill" : "checklist") : "folder",
+                            isPrimary: false,
+                            isDisabled: isExporting || (isSelectionMode && filteredSongs.isEmpty)
+                        ) {
+                            if isSelectionMode {
+                                toggleVisibleSelection()
+                            } else {
+                                pendingExportAfterFolderSelection = false
+                                showingFolderPicker = true
+                            }
+                        }
+
+                        if isSelectionMode {
+                            actionCapsule(
+                                title: "Add to Playlist",
+                                systemImage: "text.badge.plus",
+                                isPrimary: false,
+                                isDisabled: selectedIDs.isEmpty || playlists.isEmpty
+                            ) {
+                                showingAddToPlaylistSheet = true
+                            }
+
+                            actionCapsule(
+                                title: "Add to Album",
+                                systemImage: "square.stack.badge.plus",
+                                isPrimary: false,
+                                isDisabled: selectedIDs.isEmpty
+                            ) {
+                                showingAddToAlbumSheet = true
+                            }
+                        }
+
+                        actionCapsule(
+                            title: isExporting ? "Exporting..." : "Export",
+                            systemImage: "square.and.arrow.up",
+                            isPrimary: false,
+                            isDisabled: selectedIDs.isEmpty || isLoading || isExporting
+                        ) {
+                            exportSelectedSongs()
+                        }
                     }
+                    .padding(.horizontal, 2)
                 }
-                .padding(.horizontal, 2)
-            }
-
-            HStack(spacing: 8) {
-                Text("Export Folder")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(mutedTextColor)
-
-                Button {
-                    pendingExportAfterFolderSelection = false
-                    showingFolderPicker = true
-                } label: {
-                    Text(preferredExportFolder?.lastPathComponent ?? "Choose Folder")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
             }
 
             searchField
@@ -469,11 +631,11 @@ struct DeviceLibraryBrowserView: View {
             switch libraryMode {
             case .songs:
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(groupedSongs, id: \.key) { section in
+                    ForEach(cachedGroupedSongs, id: \.key) { section in
                         Text(section.key)
                             .font(.headline.weight(.semibold))
                             .foregroundStyle(strongTextColor)
-                            .padding(.top, section.key == groupedSongs.first?.key ? 2 : 18)
+                            .padding(.top, section.key == cachedGroupedSongs.first?.key ? 2 : 18)
                             .padding(.bottom, 8)
 
                         ForEach(Array(section.songs.enumerated()), id: \.element.id) { index, song in
@@ -486,28 +648,31 @@ struct DeviceLibraryBrowserView: View {
                         }
                     }
                 }
+                .id(cachedGroupedSongs.count)
             case .artists:
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(artistEntries.enumerated()), id: \.element.id) { index, artist in
+                    ForEach(Array(cachedArtistEntries.enumerated()), id: \.element.id) { index, artist in
                         artistRow(artist)
-                        if index < artistEntries.count - 1 {
+                        if index < cachedArtistEntries.count - 1 {
                             Divider()
                                 .overlay(hairlineColor)
                                 .padding(.leading, 64)
                         }
                     }
                 }
+                .id(cachedArtistEntries.count)
             case .albums:
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(albumEntries.enumerated()), id: \.element.id) { index, album in
+                    ForEach(Array(cachedAlbumEntries.enumerated()), id: \.element.id) { index, album in
                         albumRow(album)
-                        if index < albumEntries.count - 1 {
+                        if index < cachedAlbumEntries.count - 1 {
                             Divider()
                                 .overlay(hairlineColor)
                                 .padding(.leading, 64)
                         }
                     }
                 }
+                .id(cachedAlbumEntries.count)
             case .playlists:
                 playlistListView()
             }
@@ -575,8 +740,11 @@ struct DeviceLibraryBrowserView: View {
             loadArtworkIfNeeded(for: song)
         }
         .onTapGesture {
-            guard isSelectionMode else { return }
-            toggleSelection(song.id)
+            if isSelectionMode {
+                toggleSelection(song.id)
+            } else {
+                songForQualityAnalysis = song
+            }
         }
         .contextMenu {
             if !isSelectionMode {
@@ -584,6 +752,12 @@ struct DeviceLibraryBrowserView: View {
                     beginEditing(song)
                 } label: {
                     Label("Edit Metadata", systemImage: "pencil")
+                }
+
+                Button {
+                    songForAudioReplace = song
+                } label: {
+                    Label("Replace Audio File", systemImage: "waveform.badge.exclamationmark")
                 }
 
                 Button(role: .destructive) {
@@ -638,7 +812,9 @@ struct DeviceLibraryBrowserView: View {
             groupedSongListView(
                 title: album.name,
                 subtitle: album.artist,
-                songs: album.songs
+                songs: album.songs,
+                onEdit: { editingAlbum = album },
+                onAddSongs: { addingSongsToAlbum = album }
             )
         } label: {
             HStack(spacing: 10) {
@@ -678,7 +854,9 @@ struct DeviceLibraryBrowserView: View {
     private func groupedSongListView(
         title: String,
         subtitle: String,
-        songs: [DeviceManager.ExportableSongInfo]
+        songs: [DeviceManager.ExportableSongInfo],
+        onEdit: (() -> Void)? = nil,
+        onAddSongs: (() -> Void)? = nil
     ) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -730,6 +908,52 @@ struct DeviceLibraryBrowserView: View {
                                 Image(systemName: areAllSelected(in: songs) ? "checkmark.circle.fill" : "checklist")
                                     .font(.system(size: 14, weight: .semibold))
                                 Text(areAllSelected(in: songs) ? "Clear All" : "Select All")
+                                    .font(.system(size: 15, weight: .semibold))
+                            }
+                            .foregroundStyle(strongTextColor)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 46)
+                            .background(
+                                Capsule()
+                                    .fill(controlFillColor)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(hairlineColor, lineWidth: 1)
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if let onEdit {
+                        Button(action: onEdit) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "pencil")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("Edit")
+                                    .font(.system(size: 15, weight: .semibold))
+                            }
+                            .foregroundStyle(strongTextColor)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 46)
+                            .background(
+                                Capsule()
+                                    .fill(controlFillColor)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(hairlineColor, lineWidth: 1)
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if let onAddSongs {
+                        Button(action: onAddSongs) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("Add Songs")
                                     .font(.system(size: 15, weight: .semibold))
                             }
                             .foregroundStyle(strongTextColor)
@@ -865,6 +1089,7 @@ struct DeviceLibraryBrowserView: View {
         title: String,
         systemImage: String,
         isPrimary: Bool,
+        isDestructive: Bool = false,
         isDisabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
@@ -876,7 +1101,7 @@ struct DeviceLibraryBrowserView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .lineLimit(1)
             }
-            .foregroundStyle(strongTextColor)
+            .foregroundStyle(isDestructive ? Color(red: 1.0, green: 0.27, blue: 0.42) : strongTextColor)
             .padding(.horizontal, 20)
             .frame(height: 48)
             .background(
@@ -898,9 +1123,9 @@ struct DeviceLibraryBrowserView: View {
         case .songs:
             return "\(filteredSongs.count)"
         case .artists:
-            return "\(artistEntries.count)"
+            return "\(cachedArtistEntries.count)"
         case .albums:
-            return "\(albumEntries.count)"
+            return "\(cachedAlbumEntries.count)"
         case .playlists:
             return "\(playlists.count)"
         }
@@ -909,6 +1134,36 @@ struct DeviceLibraryBrowserView: View {
     private var allFilteredSongsSelected: Bool {
         let visibleIDs = Set(filteredSongs.map(\.id))
         return !visibleIDs.isEmpty && selectedIDs.isSuperset(of: visibleIDs)
+    }
+
+    private var allPlaylistsSelected: Bool {
+        let allPids = Set(playlists.map(\.pid))
+        return !allPids.isEmpty && selectedPlaylistPids.isSuperset(of: allPids)
+    }
+
+    private func toggleAllPlaylistsSelection() {
+        let allPids = Set(playlists.map(\.pid))
+        guard !allPids.isEmpty else { return }
+        if selectedPlaylistPids.isSuperset(of: allPids) {
+            selectedPlaylistPids.subtract(allPids)
+        } else {
+            selectedPlaylistPids.formUnion(allPids)
+        }
+    }
+
+    private func togglePlaylistSelection(_ pid: Int64) {
+        if selectedPlaylistPids.contains(pid) {
+            selectedPlaylistPids.remove(pid)
+        } else {
+            selectedPlaylistPids.insert(pid)
+        }
+    }
+
+    private func deleteSelectedPlaylists() {
+        guard !selectedPlaylistPids.isEmpty else { return }
+        applyPlaylistActions(selectedPlaylistPids.map { .delete(containerPid: $0) })
+        selectedPlaylistPids.removeAll()
+        isSelectionMode = false
     }
 
     private func loadArtworkIfNeeded(for song: DeviceManager.ExportableSongInfo) {
@@ -954,9 +1209,9 @@ struct DeviceLibraryBrowserView: View {
         case .songs:
             seeds = Array(filteredSongs.prefix(18))
         case .artists:
-            seeds = artistEntries.prefix(18).compactMap { $0.songs.first }
+            seeds = cachedArtistEntries.prefix(18).compactMap { $0.songs.first }
         case .albums:
-            seeds = albumEntries.prefix(18).compactMap { $0.songs.first }
+            seeds = cachedAlbumEntries.prefix(18).compactMap { $0.songs.first }
         case .playlists:
             seeds = playlists.prefix(18).compactMap { $0.songs.first }
         }
@@ -1016,12 +1271,19 @@ struct DeviceLibraryBrowserView: View {
         }
     }
 
+    private func recomputeLibraryGroupings() {
+        cachedGroupedSongs = computeGroupedSongs()
+        cachedArtistEntries = computeArtistEntries()
+        cachedAlbumEntries = computeAlbumEntries()
+    }
+
     private func refreshSongs() {
         isLoading = true
         statusMessage = ""
         manager.fetchExportableSongs { result in
             DispatchQueue.main.async {
                 songs = result
+                recomputeLibraryGroupings()
                 selectedIDs = selectedIDs.intersection(Set(result.map(\.id)))
                 if result.isEmpty {
                     isSelectionMode = false
@@ -1049,6 +1311,44 @@ struct DeviceLibraryBrowserView: View {
         }
     }
     
+    private func playlistRowContent(_ playlist: PlaylistEntry) -> some View {
+        HStack(spacing: 16) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.tertiarySystemGroupedBackground))
+                    .frame(width: 48, height: 48)
+                Image(systemName: "music.note.list")
+                    .font(.title3)
+                    .foregroundStyle(mutedTextColor)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(playlist.name)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(strongTextColor)
+                Text("\(playlist.songs.count) songs")
+                    .font(.subheadline)
+                    .foregroundStyle(mutedTextColor)
+            }
+            Spacer()
+            if isSelectionMode {
+                if selectedPlaylistPids.contains(playlist.pid) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
+                } else {
+                    Circle()
+                        .stroke(mutedTextColor, lineWidth: 1)
+                        .frame(width: 22, height: 22)
+                }
+            } else {
+                Image(systemName: "chevron.right")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color(.tertiaryLabel))
+            }
+        }
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
+
     private func playlistListView() -> some View {
         LazyVStack(alignment: .leading, spacing: 0) {
             Button {
@@ -1069,40 +1369,29 @@ struct DeviceLibraryBrowserView: View {
             Divider().overlay(hairlineColor).padding(.leading, 64)
             
             ForEach(playlists) { playlist in
-                NavigationLink(destination: playlistDetailView(playlist)) {
-                    HStack(spacing: 16) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color(.tertiarySystemGroupedBackground))
-                                .frame(width: 48, height: 48)
-                            Image(systemName: "music.note.list")
-                                .font(.title3)
-                                .foregroundStyle(mutedTextColor)
+                Group {
+                    if isSelectionMode {
+                        Button {
+                            togglePlaylistSelection(playlist.pid)
+                        } label: {
+                            playlistRowContent(playlist)
                         }
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(playlist.name)
-                                .font(.body.weight(.semibold))
-                                .foregroundStyle(strongTextColor)
-                            Text("\(playlist.songs.count) songs")
-                                .font(.subheadline)
-                                .foregroundStyle(mutedTextColor)
+                        .buttonStyle(.plain)
+                    } else {
+                        NavigationLink(destination: playlistDetailView(playlist)) {
+                            playlistRowContent(playlist)
                         }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Color(.tertiaryLabel))
-                    }
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.plain)
-                .contextMenu {
-                    Button(role: .destructive) {
-                        applyPlaylistActions([.delete(containerPid: playlist.pid)])
-                    } label: {
-                        Label("Delete Playlist", systemImage: "trash")
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                applyPlaylistActions([.delete(containerPid: playlist.pid)])
+                            } label: {
+                                Label("Delete Playlist", systemImage: "trash")
+                            }
+                        }
                     }
                 }
-                
+
                 Divider()
                     .overlay(hairlineColor)
                     .padding(.leading, 64)
@@ -1176,20 +1465,36 @@ struct DeviceLibraryBrowserView: View {
     @State private var addingToPlaylistPid: Int64? = nil
 
     private func playlistDetailView(_ playlist: PlaylistEntry) -> some View {
-        ScrollView {
+        let current = playlists.first(where: { $0.pid == playlist.pid }) ?? playlist
+
+        return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(playlist.name)
-                        .font(.system(size: 36, weight: .bold))
-                        .foregroundStyle(strongTextColor)
-                    Text("\(playlist.songs.count) song\(playlist.songs.count == 1 ? "" : "s")")
+                    HStack(spacing: 10) {
+                        Text(current.name)
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundStyle(strongTextColor)
+                            .lineLimit(1)
+
+                        Button {
+                            renamePlaylistPid = current.pid
+                            renamePlaylistText = current.name
+                            showingRenamePlaylistPrompt = true
+                        } label: {
+                            Image(systemName: "pencil.circle.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(mutedTextColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Text("\(current.songs.count) song\(current.songs.count == 1 ? "" : "s")")
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(mutedTextColor)
                 }
 
                 HStack(spacing: 12) {
                     Button {
-                        addingToPlaylistPid = playlist.pid
+                        addingToPlaylistPid = current.pid
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "plus")
@@ -1213,9 +1518,9 @@ struct DeviceLibraryBrowserView: View {
                 }
 
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(playlist.songs.enumerated()), id: \.element.id) { index, song in
-                        playlistSongRow(song, playlist: playlist)
-                        if index < playlist.songs.count - 1 {
+                    ForEach(Array(current.songs.enumerated()), id: \.element.id) { index, song in
+                        playlistSongRow(song, playlist: current)
+                        if index < current.songs.count - 1 {
                             Divider()
                                 .overlay(hairlineColor)
                                 .padding(.leading, 64)
@@ -1243,8 +1548,18 @@ struct DeviceLibraryBrowserView: View {
             )
             .presentationDetents([.medium, .large])
         }
+        .alert("Rename Playlist", isPresented: $showingRenamePlaylistPrompt) {
+            TextField("Name", text: $renamePlaylistText)
+            Button("Cancel", role: .cancel) { renamePlaylistPid = nil }
+            Button("Save") {
+                if let pid = renamePlaylistPid, !renamePlaylistText.isEmpty {
+                    applyPlaylistActions([.rename(containerPid: pid, newName: renamePlaylistText)])
+                }
+                renamePlaylistPid = nil
+            }
+        }
     }
-    
+
     private struct AddSheetItem: Identifiable {
         let pid: Int64
         var id: Int64 { pid }
@@ -1311,6 +1626,81 @@ struct DeviceLibraryBrowserView: View {
         }
     }
 
+    private func applyAlbumMetadataEdits(
+        to targetSongs: [DeviceManager.ExportableSongInfo],
+        artist: String,
+        album: String,
+        genre: String,
+        year: Int,
+        artworkData: Data?,
+        explicitRating: Int?
+    ) {
+        guard !targetSongs.isEmpty else { return }
+        isLoading = true
+        isApplyingAlbumEdit = true
+        statusMessage = ""
+        manager.updateExportableSongsMetadata(
+            originals: targetSongs,
+            artist: artist,
+            album: album,
+            genre: genre,
+            year: year,
+            artworkData: artworkData,
+            explicitRating: explicitRating
+        ) { success, message in
+            DispatchQueue.main.async {
+                isLoading = false
+                isApplyingAlbumEdit = false
+                statusMessage = message
+                if success {
+                    refreshSongs()
+                }
+            }
+        }
+    }
+
+    private func suggestedSongs(
+        for album: AlbumEntry,
+        in candidates: [DeviceManager.ExportableSongInfo]
+    ) -> [DeviceManager.ExportableSongInfo] {
+        let albumYear = album.songs.first(where: { $0.year > 0 })?.year ?? 0
+        let normalizedAlbumArtist = album.artist
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+
+        return candidates
+            .filter { candidate in
+                let normalizedCandidateArtist = candidate.artist
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+                guard normalizedCandidateArtist == normalizedAlbumArtist else { return false }
+                guard albumYear > 0, candidate.year > 0 else { return true }
+                return abs(candidate.year - albumYear) <= 1
+            }
+            .sorted { lhs, rhs in
+                if albumYear > 0, lhs.year > 0, rhs.year > 0 {
+                    let lhsDistance = abs(lhs.year - albumYear)
+                    let rhsDistance = abs(rhs.year - albumYear)
+                    if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+                }
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+    }
+
+    private func replaceSongAudioFile(_ song: DeviceManager.ExportableSongInfo, with newLocalURL: URL) {
+        isLoading = true
+        statusMessage = "Replacing audio file for \(song.title)..."
+        manager.replaceExportableSongAudioFile(original: song, newLocalURL: newLocalURL) { success, message in
+            DispatchQueue.main.async {
+                isLoading = false
+                statusMessage = message
+                if success {
+                    refreshSongs()
+                }
+            }
+        }
+    }
+
     private func deleteSong(_ song: DeviceManager.ExportableSongInfo) {
         isLoading = true
         statusMessage = ""
@@ -1349,9 +1739,38 @@ struct DeviceLibraryBrowserView: View {
         }
     }
 
+    private var selectedPlaylistSongs: [DeviceManager.ExportableSongInfo] {
+        var seenIDs = Set<String>()
+        return playlists
+            .filter { selectedPlaylistPids.contains($0.pid) }
+            .flatMap(\.songs)
+            .filter { seenIDs.insert($0.id).inserted }
+    }
+
+    private func exportSelectedPlaylists() {
+        let items = selectedPlaylistSongs
+        guard !items.isEmpty else { return }
+
+        guard let preferredExportFolder else {
+            pendingPlaylistExportAfterFolderSelection = true
+            showingFolderPicker = true
+            return
+        }
+
+        isExporting = true
+        statusMessage = "Exporting \(items.count) song(s) to \(preferredExportFolder.lastPathComponent)..."
+        manager.exportSongs(items, destinationFolder: preferredExportFolder) { success, message, _ in
+            DispatchQueue.main.async {
+                isExporting = false
+                statusMessage = success ? message : "\(message) Tap Change Folder and pick another location."
+            }
+        }
+    }
+
     private func handleExportFolderSelection(url: URL?) {
         guard let url else {
             pendingExportAfterFolderSelection = false
+            pendingPlaylistExportAfterFolderSelection = false
             return
         }
 
@@ -1366,15 +1785,22 @@ struct DeviceLibraryBrowserView: View {
             let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             UserDefaults.standard.set(bookmark, forKey: Self.exportFolderBookmarkKey)
             statusMessage = "Export folder set to \(url.lastPathComponent)."
-            let shouldExportNow = pendingExportAfterFolderSelection
+            let shouldExportSongsNow = pendingExportAfterFolderSelection
+            let shouldExportPlaylistsNow = pendingPlaylistExportAfterFolderSelection
             pendingExportAfterFolderSelection = false
-            if shouldExportNow {
+            pendingPlaylistExportAfterFolderSelection = false
+            if shouldExportSongsNow {
                 DispatchQueue.main.async {
                     exportSelectedSongs()
+                }
+            } else if shouldExportPlaylistsNow {
+                DispatchQueue.main.async {
+                    exportSelectedPlaylists()
                 }
             }
         } catch {
             pendingExportAfterFolderSelection = false
+            pendingPlaylistExportAfterFolderSelection = false
             statusMessage = "Could not save export folder."
         }
     }
@@ -1624,6 +2050,338 @@ struct AddSongsToPlaylistSheet: View {
                     }
                     .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
                     .disabled(selectedPids.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+struct AddSongsToAlbumSheet: View {
+    let album: DeviceLibraryBrowserView.AlbumEntry
+    let candidateSongs: [DeviceManager.ExportableSongInfo]
+    let suggestedSongs: [DeviceManager.ExportableSongInfo]
+    let onAdd: ([DeviceManager.ExportableSongInfo]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var selectedIDs = Set<String>()
+    @State private var searchText = ""
+
+    private var pageBackground: Color {
+        colorScheme == .dark ? Color(red: 0.1, green: 0.1, blue: 0.12) : Color(red: 0.95, green: 0.95, blue: 0.97)
+    }
+
+    private var strongTextColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
+
+    private var mutedTextColor: Color {
+        colorScheme == .dark ? Color(white: 0.6) : Color(white: 0.4)
+    }
+
+    private var hairlineColor: Color {
+        colorScheme == .dark ? Color(white: 0.3) : Color(white: 0.85)
+    }
+
+    private var controlFillColor: Color {
+        colorScheme == .dark ? Color(white: 0.2) : Color(white: 0.92)
+    }
+
+    private func matches(_ song: DeviceManager.ExportableSongInfo) -> Bool {
+        searchText.isEmpty || song.title.localizedCaseInsensitiveContains(searchText) || song.artist.localizedCaseInsensitiveContains(searchText)
+    }
+
+    private var remainingSongs: [DeviceManager.ExportableSongInfo] {
+        let suggestedIDs = Set(suggestedSongs.map(\.id))
+        return candidateSongs
+            .filter { !suggestedIDs.contains($0.id) }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    private var filteredSuggested: [DeviceManager.ExportableSongInfo] {
+        suggestedSongs.filter(matches)
+    }
+
+    private var filteredRemaining: [DeviceManager.ExportableSongInfo] {
+        remainingSongs.filter(matches)
+    }
+
+    @ViewBuilder
+    private func songRow(_ song: DeviceManager.ExportableSongInfo) -> some View {
+        Button {
+            if selectedIDs.contains(song.id) {
+                selectedIDs.remove(song.id)
+            } else {
+                selectedIDs.insert(song.id)
+            }
+        } label: {
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(song.title)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(strongTextColor)
+                        .lineLimit(1)
+                    Text(song.artist)
+                        .font(.subheadline)
+                        .foregroundStyle(mutedTextColor)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if selectedIDs.contains(song.id) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
+                } else {
+                    Circle()
+                        .stroke(mutedTextColor, lineWidth: 1)
+                        .frame(width: 22, height: 22)
+                }
+            }
+            .padding(.vertical, 12)
+            .padding(.horizontal, 20)
+        }
+        .buttonStyle(.plain)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                pageBackground.ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    HStack {
+                        Image(systemName: "magnifyingglass").foregroundStyle(mutedTextColor)
+                        TextField("Search songs", text: $searchText)
+                            .foregroundStyle(strongTextColor)
+                            .textInputAutocapitalization(.never)
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(controlFillColor))
+                    .padding()
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            if !filteredSuggested.isEmpty {
+                                Text("Suggested")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(mutedTextColor)
+                                    .padding(.horizontal, 20)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, 4)
+                                ForEach(Array(filteredSuggested.enumerated()), id: \.element.id) { index, song in
+                                    songRow(song)
+                                    if index < filteredSuggested.count - 1 {
+                                        Divider().background(hairlineColor).padding(.leading, 20)
+                                    }
+                                }
+                            }
+
+                            if !filteredRemaining.isEmpty {
+                                Text("All Songs")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(mutedTextColor)
+                                    .padding(.horizontal, 20)
+                                    .padding(.top, 12)
+                                    .padding(.bottom, 4)
+                                ForEach(Array(filteredRemaining.enumerated()), id: \.element.id) { index, song in
+                                    songRow(song)
+                                    if index < filteredRemaining.count - 1 {
+                                        Divider().background(hairlineColor).padding(.leading, 20)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.bottom, 20)
+                    }
+                }
+            }
+            .navigationTitle("Add Songs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(pageBackground, for: .navigationBar)
+            .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Add") {
+                        onAdd(candidateSongs.filter { selectedIDs.contains($0.id) })
+                        dismiss()
+                    }
+                    .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
+                    .disabled(selectedIDs.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+struct AddToAlbumView: View {
+    let albums: [DeviceLibraryBrowserView.AlbumEntry]
+    let onSelectAlbum: (DeviceLibraryBrowserView.AlbumEntry) -> Void
+    let onCreateNewAlbum: (_ artist: String, _ album: String, _ genre: String, _ year: Int) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var showingNewAlbumForm = false
+    @State private var newAlbumName = ""
+    @State private var newAlbumArtist = ""
+    @State private var newAlbumGenre = ""
+    @State private var newAlbumYear = ""
+
+    private var pageBackground: Color {
+        colorScheme == .dark ? Color(red: 0.1, green: 0.1, blue: 0.12) : Color(red: 0.95, green: 0.95, blue: 0.97)
+    }
+
+    private var panelBackground: Color {
+        colorScheme == .dark ? Color(red: 0.15, green: 0.15, blue: 0.17) : Color.white
+    }
+
+    private var strongTextColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
+
+    private var mutedTextColor: Color {
+        colorScheme == .dark ? Color(white: 0.6) : Color(white: 0.4)
+    }
+
+    private var hairlineColor: Color {
+        colorScheme == .dark ? Color(white: 0.3) : Color(white: 0.85)
+    }
+
+    private var controlFillColor: Color {
+        colorScheme == .dark ? Color(white: 0.2) : Color(white: 0.92)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                pageBackground.ignoresSafeArea()
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        if showingNewAlbumForm {
+                            VStack(alignment: .leading, spacing: 12) {
+                                TextField("Album name", text: $newAlbumName)
+                                    .textFieldStyle(.roundedBorder)
+                                TextField("Album artist", text: $newAlbumArtist)
+                                    .textFieldStyle(.roundedBorder)
+                                TextField("Genre", text: $newAlbumGenre)
+                                    .textFieldStyle(.roundedBorder)
+                                TextField("Year", text: $newAlbumYear)
+                                    .keyboardType(.numberPad)
+                                    .textFieldStyle(.roundedBorder)
+
+                                Button {
+                                    onCreateNewAlbum(
+                                        newAlbumArtist,
+                                        newAlbumName,
+                                        newAlbumGenre,
+                                        Int(newAlbumYear.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                                    )
+                                    dismiss()
+                                } label: {
+                                    Text("Create Album")
+                                        .font(.body.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(Color(red: 1.0, green: 0.27, blue: 0.42))
+                                        .foregroundStyle(.white)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                                }
+                                .disabled(newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                            .padding()
+                            .background(panelBackground)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .padding(.horizontal)
+                        } else {
+                            Button {
+                                showingNewAlbumForm = true
+                            } label: {
+                                HStack(spacing: 14) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(controlFillColor)
+                                            .frame(width: 48, height: 48)
+                                        Image(systemName: "plus")
+                                            .font(.title3)
+                                            .foregroundStyle(mutedTextColor)
+                                    }
+                                    Text("New Album")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundStyle(strongTextColor)
+                                    Spacer()
+                                }
+                                .padding(.vertical, 8)
+                                .padding(.horizontal, 20)
+                                .background(panelBackground)
+                            }
+                            .buttonStyle(.plain)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .padding(.horizontal)
+                        }
+
+                        VStack(spacing: 0) {
+                            if albums.isEmpty {
+                                Text("No albums found.")
+                                    .foregroundStyle(mutedTextColor)
+                                    .padding(.top, 40)
+                            } else {
+                                ForEach(Array(albums.enumerated()), id: \.element.id) { index, album in
+                                    Button {
+                                        onSelectAlbum(album)
+                                        dismiss()
+                                    } label: {
+                                        HStack(spacing: 14) {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .fill(controlFillColor)
+                                                    .frame(width: 48, height: 48)
+                                                Image(systemName: "square.stack")
+                                                    .font(.title3)
+                                                    .foregroundStyle(mutedTextColor)
+                                            }
+
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text(album.name)
+                                                    .font(.body.weight(.semibold))
+                                                    .foregroundStyle(strongTextColor)
+                                                    .lineLimit(1)
+                                                Text("\(album.artist) · \(album.songs.count) track\(album.songs.count == 1 ? "" : "s")")
+                                                    .font(.subheadline)
+                                                    .foregroundStyle(mutedTextColor)
+                                                    .lineLimit(1)
+                                            }
+                                            Spacer()
+                                        }
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 20)
+                                        .background(panelBackground)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    if index < albums.count - 1 {
+                                        Divider()
+                                            .background(hairlineColor)
+                                            .padding(.leading, 82)
+                                    }
+                                }
+                            }
+                        }
+                        .background(panelBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal)
+                    }
+                    .padding(.vertical)
+                }
+            }
+            .navigationTitle("Add to Album")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(pageBackground, for: .navigationBar)
+            .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
                 }
             }
         }

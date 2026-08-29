@@ -53,6 +53,14 @@ struct SongRowView: View {
                             .font(.system(size: 10))
                             .foregroundColor(Color.accentColor)
                     }
+
+                    Text(song.audioFormatLabel)
+                        .font(.system(size: 8, weight: .black))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(song.isLosslessAudio ? Color.purple : Color(.systemGray4))
+                        .foregroundColor(song.isLosslessAudio ? .white : Color(.systemGray))
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
                     
                     if let lyrics = song.lyrics, !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Image(systemName: "text.quote")

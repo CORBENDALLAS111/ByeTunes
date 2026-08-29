@@ -267,6 +267,7 @@ struct LibraryRepairView: View {
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(Color(.systemGray5), lineWidth: 1)
                     )
+
                 }
                 .padding(16)
                 .padding(.bottom, 120)

@@ -15,9 +15,7 @@ final class DownloadLiveActivityManager {
     }
 
     func update(
-        trackName: String,
-        artistName: String,
-        progress: Double,
+        items: [DownloadLiveActivityAttributes.ActiveItem],
         queueText: String,
         speedBps: Double,
         phase: DownloadLiveActivityAttributes.Phase
@@ -25,9 +23,7 @@ final class DownloadLiveActivityManager {
         guard #available(iOS 16.2, *) else { return }
         guard isEnabled else { return }
         DownloadLiveActivityRuntime.shared.update(
-            trackName: trackName,
-            artistName: artistName,
-            progress: progress,
+            items: items,
             queueText: queueText,
             speedBps: speedBps,
             phase: phase
@@ -35,16 +31,12 @@ final class DownloadLiveActivityManager {
     }
 
     func end(
-        trackName: String,
-        artistName: String,
         queueText: String,
         phase: DownloadLiveActivityAttributes.Phase
     ) {
         guard #available(iOS 16.2, *) else { return }
         guard isEnabled else { return }
         DownloadLiveActivityRuntime.shared.end(
-            trackName: trackName,
-            artistName: artistName,
             queueText: queueText,
             phase: phase
         )
@@ -71,9 +63,7 @@ private final class DownloadLiveActivityRuntime {
     private init() {}
 
     func update(
-        trackName: String,
-        artistName: String,
-        progress: Double,
+        items: [DownloadLiveActivityAttributes.ActiveItem],
         queueText: String,
         speedBps: Double,
         phase: DownloadLiveActivityAttributes.Phase
@@ -81,9 +71,7 @@ private final class DownloadLiveActivityRuntime {
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
 
         let state = DownloadLiveActivityAttributes.ContentState(
-            trackName: trackName,
-            artistName: artistName,
-            progress: max(0, min(progress, 1)),
+            items: items,
             queueText: queueText,
             statusText: statusText(for: phase),
             speedText: formattedSpeed(speedBps),
@@ -94,15 +82,11 @@ private final class DownloadLiveActivityRuntime {
     }
 
     func end(
-        trackName: String,
-        artistName: String,
         queueText: String,
         phase: DownloadLiveActivityAttributes.Phase
     ) {
         let state = DownloadLiveActivityAttributes.ContentState(
-            trackName: trackName,
-            artistName: artistName,
-            progress: (phase == .completed || phase == .allCompleted) ? 1 : 0,
+            items: [],
             queueText: queueText,
             statusText: statusText(for: phase),
             speedText: formattedSpeed(0),
@@ -138,21 +122,7 @@ private final class DownloadLiveActivityRuntime {
         }
     }
 
-    private func enqueueUpdate(_ incomingState: DownloadLiveActivityAttributes.ContentState) {
-        var state = incomingState
-        if
-            let lastState,
-            lastState.trackName == state.trackName,
-            lastState.artistName == state.artistName,
-            lastState.phase == .downloading,
-            state.phase == .preparing
-        {
-            state.progress = lastState.progress
-            state.speedText = lastState.speedText
-            state.statusText = statusText(for: .downloading)
-            state.phase = .downloading
-        }
-
+    private func enqueueUpdate(_ state: DownloadLiveActivityAttributes.ContentState) {
         pendingState = state
         guard updateTask == nil else { return }
 

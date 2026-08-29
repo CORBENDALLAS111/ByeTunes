@@ -4,10 +4,14 @@ import Foundation
 import ActivityKit
 
 struct DownloadLiveActivityAttributes: ActivityAttributes {
-    public struct ContentState: Codable, Hashable {
+    public struct ActiveItem: Codable, Hashable {
         var trackName: String
         var artistName: String
         var progress: Double
+    }
+
+    public struct ContentState: Codable, Hashable {
+        var items: [ActiveItem]
         var queueText: String
         var statusText: String
         var speedText: String

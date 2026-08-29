@@ -7,9 +7,9 @@ struct BackupRestoreView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
 
-    @AppStorage("fullBackupSnapshots") private var fullBackupSnapshots = false
     @State private var isSnapshotBusy = false
     @State private var isCreatingSnapshot = false
+    @State private var isCreatingFullBackup = false
     @State private var snapshotProgressTitle = "Working on Backup"
     @State private var snapshotProgressMessage = ""
     @State private var snapshotProgress: Double? = nil
@@ -93,7 +93,7 @@ struct BackupRestoreView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("DATABASE SNAPSHOTS")
+                        Text("BACKUPS")
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundColor(.secondary)
@@ -101,69 +101,76 @@ struct BackupRestoreView: View {
                             .padding(.horizontal, 4)
 
                         VStack(spacing: 0) {
-                            Toggle(isOn: $fullBackupSnapshots) {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "archivebox.fill")
-                                        .font(.body)
-                                        .foregroundColor(.accentColor)
-                                        .frame(width: 28)
-
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(fullBackupSnapshots ? "Full Backup" : "Light Backup")
-                                            .font(.body.weight(.medium))
-                                        Text(fullBackupSnapshots ? "Includes song files." : "Database only.")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Button {
-                                        showInfo(
-                                            "Full vs. Light Backup",
-                                            "Light Backup (off) saves just the database: playlists, song metadata, and library structure. Fast and small.\n\nFull Backup (on) also saves the actual song files, so a restore doesn't need you to re-download anything. Takes more space and time to create."
-                                        )
-                                    } label: {
-                                        infoButton
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .toggleStyle(SwitchToggleStyle(tint: .accentColor))
-                            .padding(.vertical, 14)
-                            .padding(.horizontal, 16)
-
-                            Divider().padding(.leading, 56)
-
                             HStack {
                                 Button {
-                                    createSnapshotBackup()
+                                    createSnapshotBackup(full: false)
                                 } label: {
-                                    HStack {
-                                        Image(systemName: "plus.app.fill")
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "archivebox")
                                             .font(.body)
                                             .foregroundColor(.accentColor)
                                             .frame(width: 28)
 
                                         VStack(alignment: .leading, spacing: 2) {
-                                            Text("Create Database Backup")
+                                            Text("Light Backup")
                                                 .font(.body.weight(.medium))
                                                 .foregroundColor(.primary)
-                                            Text("Save a snapshot now.")
+                                            Text("Database only. Fast and small.")
                                                 .font(.caption)
                                                 .foregroundColor(.secondary)
                                         }
                                     }
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(!manager.heartbeatReady)
+                                .disabled(isSnapshotBusy || !manager.heartbeatReady)
 
                                 Spacer()
 
                                 Button {
                                     showInfo(
-                                        "Create Database Backup",
-                                        "Saves a snapshot of your current library (playlists, song metadata, and library structure) that you can restore later from Manage Backups. Turn on Full Backup above to also include the song files."
+                                        "Light Backup",
+                                        "Saves just the database: playlists, song metadata, and library structure. Fast and small. Restore it later from Manage Backups."
+                                    )
+                                } label: {
+                                    infoButton
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.vertical, 14)
+                            .padding(.horizontal, 16)
+                            .opacity(manager.heartbeatReady ? 1 : 0.55)
+
+                            Divider().padding(.leading, 56)
+
+                            HStack {
+                                Button {
+                                    createSnapshotBackup(full: true)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "archivebox.fill")
+                                            .font(.body)
+                                            .foregroundColor(.accentColor)
+                                            .frame(width: 28)
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Full Backup")
+                                                .font(.body.weight(.medium))
+                                                .foregroundColor(.primary)
+                                            Text("Includes song files. Takes more space and time.")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isSnapshotBusy || !manager.heartbeatReady)
+
+                                Spacer()
+
+                                Button {
+                                    showInfo(
+                                        "Full Backup",
+                                        "Saves the database plus the actual song files, so a restore doesn't need you to re-download anything. Also bundles a playlist file for each of your playlists. Takes more space and time to create. Share it from Manage Backups if you want a copy in Files, iCloud Drive, or AirDrop."
                                     )
                                 } label: {
                                     infoButton
@@ -222,62 +229,6 @@ struct BackupRestoreView: View {
                             }
                             .padding(.vertical, 14)
                             .padding(.horizontal, 16)
-                        }
-                        .background(cardBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color(.systemGray5), lineWidth: 1)
-                        )
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("PORTABLE LIBRARY")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.secondary)
-                            .tracking(0.8)
-                            .padding(.horizontal, 4)
-
-                        VStack(spacing: 0) {
-                            HStack {
-                                Button {
-                                    exportFullLibrary()
-                                } label: {
-                                    HStack {
-                                        Image(systemName: "square.and.arrow.up.on.square")
-                                            .font(.body)
-                                            .foregroundColor(.accentColor)
-                                            .frame(width: 28)
-
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("Export Full Library")
-                                                .font(.body.weight(.medium))
-                                                .foregroundColor(.primary)
-                                            Text("Back up and share your whole library.")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                        }
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(isSnapshotBusy || !manager.heartbeatReady)
-
-                                Spacer()
-
-                                Button {
-                                    showInfo(
-                                        "Export Full Library",
-                                        "Creates a fresh Full Backup (database, song files, and artwork), adds a playlist file for each of your playlists, then opens the share sheet so you can save it to Files, iCloud Drive, AirDrop it, or anywhere else. You can bring it back later with Import Library on the Manage Backups screen."
-                                    )
-                                } label: {
-                                    infoButton
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.vertical, 14)
-                            .padding(.horizontal, 16)
-                            .opacity(manager.heartbeatReady ? 1 : 0.55)
                         }
                         .background(cardBackground)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -413,54 +364,25 @@ struct BackupRestoreView: View {
     }
 
     // MARK: - Snapshot Helpers
-    private func createSnapshotBackup() {
+    private func createSnapshotBackup(full: Bool) {
         isSnapshotBusy = true
         isCreatingSnapshot = true
-        updateSnapshotProgress(title: fullBackupSnapshots ? "Creating Full Backup" : "Creating Backup", message: "Preparing backup...", progress: nil)
-        
-        manager.createDatabaseSnapshot { message, progress in
+        isCreatingFullBackup = full
+        updateSnapshotProgress(title: full ? "Creating Full Backup" : "Creating Backup", message: "Preparing backup...", progress: nil)
+
+        manager.createDatabaseSnapshot(forceDbOnly: !full, forceFullBackup: full) { message, progress in
             DispatchQueue.main.async {
-                self.updateSnapshotProgress(title: self.fullBackupSnapshots ? "Creating Full Backup" : "Creating Backup", message: message, progress: progress)
+                self.updateSnapshotProgress(title: full ? "Creating Full Backup" : "Creating Backup", message: message, progress: progress)
             }
         } completion: { success, message in
             DispatchQueue.main.async {
                 self.isSnapshotBusy = false
                 self.isCreatingSnapshot = false
-                self.updateSnapshotProgress(title: self.fullBackupSnapshots ? "Creating Full Backup" : "Creating Backup", message: message, progress: success ? 1 : nil)
+                self.updateSnapshotProgress(title: full ? "Creating Full Backup" : "Creating Backup", message: message, progress: success ? 1 : nil)
                 self.showToastMessage(
                     title: success ? message : "Backup Failed: \(message)",
                     icon: success ? "checkmark.circle.fill" : "xmark.circle.fill"
                 )
-            }
-        }
-    }
-
-    private func exportFullLibrary() {
-        isSnapshotBusy = true
-        isCreatingSnapshot = true
-        updateSnapshotProgress(title: "Exporting Full Library", message: "Preparing backup...", progress: nil)
-
-        manager.exportFullLibrary { message, progress in
-            DispatchQueue.main.async {
-                self.updateSnapshotProgress(title: "Exporting Full Library", message: message, progress: progress)
-            }
-        } completion: { success, message, folderURL in
-            DispatchQueue.main.async {
-                self.isSnapshotBusy = false
-                self.isCreatingSnapshot = false
-
-                guard success, let folderURL else {
-                    self.showToastMessage(title: "Export Failed: \(message)", icon: "xmark.circle.fill")
-                    return
-                }
-
-                let root = self.manager.snapshotsDirectoryURL
-                let needsSecurityScope = root.startAccessingSecurityScopedResource()
-                ShareSheetHelper.share(items: [folderURL]) {
-                    if needsSecurityScope {
-                        root.stopAccessingSecurityScopedResource()
-                    }
-                }
             }
         }
     }
@@ -537,7 +459,7 @@ struct BackupRestoreView: View {
                         .font(.headline)
                         .foregroundColor(.primary)
 
-                    Text(fullBackupSnapshots ? "Hang tight, full backups can take some time." : "Hang tight, this could take some time.")
+                    Text(isCreatingFullBackup ? "Hang tight, full backups can take some time." : "Hang tight, this could take some time.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)

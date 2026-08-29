@@ -2,6 +2,43 @@ import SwiftUI
 import WidgetKit
 import ActivityKit
 
+private func downloadAccentColor(for phase: DownloadLiveActivityAttributes.Phase) -> Color {
+    switch phase {
+    case .completed, .allCompleted:
+        return .green
+    case .failed, .cancelled:
+        return .red
+    case .paused:
+        return .orange
+    default:
+        return .blue
+    }
+}
+
+private func headline(for state: DownloadLiveActivityAttributes.ContentState) -> String {
+    if let first = state.items.first {
+        return state.items.count > 1 ? "\(first.trackName) +\(state.items.count - 1) more" : first.trackName
+    }
+    switch state.phase {
+    case .completed, .allCompleted:
+        return "All downloads complete"
+    case .cancelled:
+        return "Download cancelled"
+    case .failed:
+        return "Download failed"
+    default:
+        return "Downloading"
+    }
+}
+
+private func aggregatePercentText(for state: DownloadLiveActivityAttributes.ContentState) -> String {
+    guard !state.items.isEmpty else {
+        return (state.phase == .completed || state.phase == .allCompleted) ? "100%" : "0%"
+    }
+    let average = state.items.map(\.progress).reduce(0, +) / Double(state.items.count)
+    return "\(Int((average * 100).rounded()))%"
+}
+
 private struct DownloadLiveActivityView: View {
     let state: DownloadLiveActivityAttributes.ContentState
 
@@ -12,40 +49,49 @@ private struct DownloadLiveActivityView: View {
     }
 }
 
+private struct DownloadItemRow: View {
+    let item: DownloadLiveActivityAttributes.ActiveItem
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(item.trackName)
+                    .font(.caption2.weight(.medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                Spacer(minLength: 6)
+                Text("\(Int((item.progress * 100).rounded()))%")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: item.progress)
+                .tint(accent)
+        }
+    }
+}
+
 private struct DownloadActivityCard: View {
     let state: DownloadLiveActivityAttributes.ContentState
     let isCompact: Bool
 
-    private var percentText: String {
-        "\(Int((state.progress * 100).rounded()))%"
-    }
-
-    private var accent: Color {
-        switch state.phase {
-        case .completed, .allCompleted:
-            return .green
-        case .failed, .cancelled:
-            return .red
-        case .paused:
-            return .orange
-        default:
-            return .blue
-        }
-    }
+    private var accent: Color { downloadAccentColor(for: state.phase) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: isCompact ? 7 : 9) {
             HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(state.trackName)
+                    Text(headline(for: state))
                         .font(isCompact ? .subheadline.weight(.semibold) : .headline.weight(.semibold))
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
-                    Text(state.artistName)
-                        .font(isCompact ? .caption : .subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.75)
+                    if let only = state.items.first, state.items.count == 1 {
+                        Text(only.artistName)
+                            .font(isCompact ? .caption : .subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -68,8 +114,16 @@ private struct DownloadActivityCard: View {
                 }
             }
 
-            ProgressView(value: state.progress)
-                .tint(accent)
+            if state.items.count > 1 {
+                VStack(spacing: 6) {
+                    ForEach(state.items.prefix(3), id: \.trackName) { item in
+                        DownloadItemRow(item: item, accent: accent)
+                    }
+                }
+            } else {
+                ProgressView(value: state.items.first?.progress ?? ((state.phase == .completed || state.phase == .allCompleted) ? 1 : 0))
+                    .tint(accent)
+            }
 
             HStack(spacing: 8) {
                 Text(state.statusText)
@@ -78,9 +132,11 @@ private struct DownloadActivityCard: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
                 Spacer(minLength: 8)
-                Text(percentText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                if state.items.count <= 1 {
+                    Text(aggregatePercentText(for: state))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -89,28 +145,19 @@ private struct DownloadActivityCard: View {
 private struct DownloadIslandBottomView: View {
     let state: DownloadLiveActivityAttributes.ContentState
 
-    private var percentText: String {
-        "\(Int((state.progress * 100).rounded()))%"
-    }
-
-    private var accent: Color {
-        switch state.phase {
-        case .completed, .allCompleted:
-            return .green
-        case .failed, .cancelled:
-            return .red
-        case .paused:
-            return .orange
-        default:
-            return .blue
-        }
-    }
+    private var accent: Color { downloadAccentColor(for: state.phase) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ProgressView(value: state.progress)
-                .tint(accent)
-                .controlSize(.mini)
+        VStack(alignment: .leading, spacing: 4) {
+            if state.items.count > 1 {
+                ForEach(state.items.prefix(3), id: \.trackName) { item in
+                    DownloadItemRow(item: item, accent: accent)
+                }
+            } else {
+                ProgressView(value: state.items.first?.progress ?? ((state.phase == .completed || state.phase == .allCompleted) ? 1 : 0))
+                    .tint(accent)
+                    .controlSize(.mini)
+            }
 
             HStack(spacing: 8) {
                 Text(state.statusText)
@@ -121,9 +168,11 @@ private struct DownloadIslandBottomView: View {
 
                 Spacer(minLength: 6)
 
-                Text(percentText)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                if state.items.count <= 1 {
+                    Text(aggregatePercentText(for: state))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -139,15 +188,17 @@ struct DownloadLiveActivityWidget: Widget {
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(context.state.trackName)
+                        Text(headline(for: context.state))
                             .font(.caption2.weight(.semibold))
                             .lineLimit(1)
                             .minimumScaleFactor(0.65)
-                        Text(context.state.artistName)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.65)
+                        if let only = context.state.items.first, context.state.items.count == 1 {
+                            Text(only.artistName)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.65)
+                        }
                     }
                     .padding(.leading, 12)
                     .frame(maxWidth: 145, alignment: .leading)
@@ -155,7 +206,7 @@ struct DownloadLiveActivityWidget: Widget {
 
                 DynamicIslandExpandedRegion(.trailing) {
                     VStack(alignment: .trailing, spacing: 1) {
-                        Text("\(Int((context.state.progress * 100).rounded()))%")
+                        Text(aggregatePercentText(for: context.state))
                             .font(.caption2.weight(.semibold).monospacedDigit())
                         Text(context.state.queueText)
                             .font(.caption2.weight(.semibold).monospacedDigit())

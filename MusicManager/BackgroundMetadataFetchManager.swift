@@ -1,20 +1,28 @@
 import Foundation
 import UIKit
 import Combine
+import BackgroundTasks
 
 extension Notification.Name {
     static let backgroundMetadataFetchCompleted = Notification.Name("BackgroundMetadataFetchCompleted")
+}
+
+private final class BackgroundTaskState {
+    var id: UIBackgroundTaskIdentifier = .invalid
 }
 
 @MainActor
 final class BackgroundMetadataFetchManager: ObservableObject {
     static let shared = BackgroundMetadataFetchManager()
 
+    static let processingTaskIdentifier = "com.EduAlexxis.MusicManager.metadataRefresh"
+
     private static let readySongsKey = "backgroundMetadataFetchReadySongs.v1"
 
     @Published private(set) var isProcessing = false
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var drainTask: Task<Void, Never>?
+    private var inFlightImportPaths: Set<String> = []
 
     private init() {}
 
@@ -23,6 +31,47 @@ final class BackgroundMetadataFetchManager: ObservableObject {
             return stored
         }
         return true
+    }
+
+    nonisolated func registerBackgroundTask() {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.processingTaskIdentifier, using: nil) { task in
+            Task { @MainActor in
+                self.handleBackgroundProcessingTask(task as! BGProcessingTask)
+            }
+        }
+    }
+
+    nonisolated func scheduleBackgroundProcessing() {
+        guard Self.isEnabled else { return }
+        let request = BGProcessingTaskRequest(identifier: Self.processingTaskIdentifier)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            Logger.shared.log("[BGMetadata] Failed to schedule background processing task: \(error)")
+        }
+    }
+
+    private func handleBackgroundProcessingTask(_ task: BGProcessingTask) {
+        scheduleBackgroundProcessing()
+
+        guard Self.isEnabled, !isProcessing else {
+            task.setTaskCompleted(success: true)
+            return
+        }
+
+        isProcessing = true
+        let drain = Task { @MainActor in
+            await drainQueue()
+            isProcessing = false
+            task.setTaskCompleted(success: true)
+        }
+
+        task.expirationHandler = { [weak self] in
+            drain.cancel()
+            Task { @MainActor in self?.isProcessing = false }
+        }
     }
 
     func processPendingDownloadsInBackground() {
@@ -67,7 +116,10 @@ final class BackgroundMetadataFetchManager: ObservableObject {
     private func drainQueue() async {
         while !Task.isCancelled {
             let pending = QueuePersistenceStore.loadPendingDownloadedImports()
-            guard let item = pending.first else { break }
+            guard let item = pending.first(where: { !inFlightImportPaths.contains($0.localURLPath) }) else { break }
+
+            inFlightImportPaths.insert(item.localURLPath)
+            defer { inFlightImportPaths.remove(item.localURLPath) }
 
             let url = URL(fileURLWithPath: item.localURLPath)
             guard FileManager.default.fileExists(atPath: url.path) else {
@@ -76,8 +128,9 @@ final class BackgroundMetadataFetchManager: ObservableObject {
             }
 
             var song = await parseSong(at: url)
+            let sourceTrack = item.track?.downloadTrack
             song = await SongMetadataNetworking.$useBackgroundSession.withValue(true) {
-                await enrich(song)
+                await enrich(song, sourceTrack: sourceTrack)
             }
             song = await persistDownloadedSongIfNeeded(song)
 
@@ -115,38 +168,8 @@ final class BackgroundMetadataFetchManager: ObservableObject {
         )
     }
 
-    private func enrich(_ initialSong: SongMetadata) async -> SongMetadata {
-        var song = initialSong
-
-        let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "local"
-        let autofetch = UserDefaults.standard.bool(forKey: "autofetchMetadata")
-        let fetchLyrics = UserDefaults.standard.bool(forKey: "fetchLyrics")
-
-        if metadataSource == "apple" && autofetch {
-            song = await SongMetadata.enrichWithAppleMusicMetadata(song)
-        } else if metadataSource == "itunes" && autofetch {
-            song = await SongMetadata.enrichWithiTunesMetadata(song)
-        } else if metadataSource == "deezer" && autofetch {
-            song = await SongMetadata.enrichWithDeezerMetadata(song)
-        } else if metadataSource == "local" && autofetch {
-            if UserDefaults.standard.bool(forKey: "appleRichMetadata") {
-                song = await SongMetadata.matchAppleMusicMetadata(song)
-            }
-        }
-
-        let appleSubscriptionLyrics = UserDefaults.standard.bool(forKey: "appleSubscriptionLyrics")
-        if fetchLyrics && !appleSubscriptionLyrics && (song.lyrics == nil || song.lyrics?.isEmpty == true) {
-            if let fetchedLyrics = await SongMetadata.fetchLyrics(
-                title: song.title,
-                artist: song.artist,
-                album: song.album,
-                durationMs: song.durationMs
-            ) {
-                song.lyrics = fetchedLyrics
-            }
-        }
-
-        return song
+    private func enrich(_ initialSong: SongMetadata, sourceTrack: DownloadTrack?) async -> SongMetadata {
+        await SongMetadata.enrichDownloadedSong(initialSong, sourceTrack: sourceTrack)
     }
 
     private func persistDownloadedSongIfNeeded(_ song: SongMetadata) async -> SongMetadata {
@@ -218,15 +241,26 @@ final class BackgroundMetadataFetchManager: ObservableObject {
 
     private func beginBackgroundTaskIfNeeded() {
         guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BackgroundMetadataFetch") { [weak self] in
-            guard let self else { return }
+        let taskState = BackgroundTaskState()
+        taskState.id = UIApplication.shared.beginBackgroundTask(withName: "BackgroundMetadataFetch") { [weak self] in
+            guard taskState.id != .invalid else { return }
+            let expiredID = taskState.id
+            UIApplication.shared.endBackgroundTask(expiredID)
+            taskState.id = .invalid
             Task { @MainActor in
-                self.log("Background task expired while metadata fetch was active; cancelling drain")
-                self.drainTask?.cancel()
-                self.drainTask = nil
-                self.isProcessing = false
-                self.endBackgroundTaskIfNeeded()
+                self?.log("Background task expired while metadata fetch was active; cancelling drain")
+                self?.drainTask?.cancel()
+                self?.drainTask = nil
+                self?.isProcessing = false
+                self?.clearBackgroundTaskID(expiredID)
             }
+        }
+        backgroundTaskID = taskState.id
+    }
+
+    private func clearBackgroundTaskID(_ id: UIBackgroundTaskIdentifier) {
+        if backgroundTaskID == id {
+            backgroundTaskID = .invalid
         }
     }
 

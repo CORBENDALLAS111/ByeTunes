@@ -64,20 +64,17 @@ struct PersistedDownloadQueue: Codable {
     var queueOrder: [String]
     var pendingIDs: [String]
     var failedIDs: [String]
-    var activeID: String?
+    var activeIDs: [String] = []
+    var doneIDs: [String] = []
     var totalQueueCount: Int
     var completedQueueCount: Int
     var failureReasons: [String: String]? = nil
 }
 
-struct PersistedDeferredDownloadEnrichment: Codable {
-    var localURLPath: String
-    var track: PersistedDownloadTrack
-}
-
 struct PersistedPendingDownloadedImport: Codable {
     var localURLPath: String
     var trackID: String?
+    var track: PersistedDownloadTrack?
 }
 
 enum QueuePersistenceStore {
@@ -125,18 +122,8 @@ enum QueuePersistenceStore {
         UserDefaults.standard.removeObject(forKey: downloadQueueKey)
     }
 
-    static func saveDeferredDownloadEnrichments(_ enrichments: [PersistedDeferredDownloadEnrichment]) {
-        if enrichments.isEmpty {
-            UserDefaults.standard.removeObject(forKey: deferredDownloadEnrichmentKey)
-            return
-        }
-        save(enrichments, forKey: deferredDownloadEnrichmentKey)
-    }
-
-    static func loadDeferredDownloadEnrichments() -> [PersistedDeferredDownloadEnrichment] {
-        load([PersistedDeferredDownloadEnrichment].self, forKey: deferredDownloadEnrichmentKey) ?? []
-    }
-
+    /// Clears a legacy UserDefaults key from a since-removed deferred-enrichment feature, so
+    /// installs upgrading from an older version don't keep orphaned data sitting around.
     static func clearDeferredDownloadEnrichments() {
         UserDefaults.standard.removeObject(forKey: deferredDownloadEnrichmentKey)
     }

@@ -18,9 +18,11 @@ struct DownloadView: View {
         case spotify
         case tidal
         case metadata
+        case itunes
+        case deezer
 
         static var allCases: [SearchProvider] {
-            [.appleMusic, .metadata]
+            [.appleMusic, .itunes, .deezer]
         }
 
         var id: String { rawValue }
@@ -31,6 +33,8 @@ struct DownloadView: View {
             case .spotify: return "Spotify"
             case .tidal: return "Tidal"
             case .metadata: return "iTunes + Deezer"
+            case .itunes: return "iTunes"
+            case .deezer: return "Deezer"
             }
         }
 
@@ -40,6 +44,8 @@ struct DownloadView: View {
             case .spotify: return "Search or paste a Spotify link"
             case .tidal: return "Search Tidal songs"
             case .metadata: return "Search iTunes and Deezer"
+            case .itunes: return "Search iTunes songs"
+            case .deezer: return "Search or paste a Deezer link"
             }
         }
 
@@ -49,6 +55,8 @@ struct DownloadView: View {
             case .spotify: return "Search a song and tap download"
             case .tidal: return "Search Tidal and tap download"
             case .metadata: return "Search iTunes and Deezer and tap download"
+            case .itunes: return "Search iTunes and tap download"
+            case .deezer: return "Search Deezer and tap download"
             }
         }
     }
@@ -75,11 +83,10 @@ struct DownloadView: View {
 
     @Binding var songs: [SongMetadata]
     @Binding var status: String
-    @StateObject private var vm = DownloadViewModel()
+    @StateObject private var vm = DownloadViewModel.shared
     @AppStorage("downloadSearchProvider") private var searchProviderRaw = SearchProvider.appleMusic.rawValue
     @State private var query = ""
     @State private var handledEmittedCount = 0
-    @State private var handledEnrichedCount = 0
     @State private var selectedPage: ResultsPage = .songs
     @State private var showingQueueDetails = false
     @State private var showingMaintenancePanel = false
@@ -118,7 +125,7 @@ struct DownloadView: View {
                         showingQueueDetails = true
                     } label: {
                         DownloadQueueIndicator(
-                            progress: vm.currentSongProgress,
+                            progress: vm.aggregateDownloadProgress,
                             label: vm.queueCounterText
                         )
                     }
@@ -295,29 +302,14 @@ struct DownloadView: View {
             }
             handledEmittedCount = newCount
         }
-        .onChange(of: vm.enrichedSongs.count) { newCount in
-            guard newCount > handledEnrichedCount else { return }
-            for idx in handledEnrichedCount..<newCount {
-                let song = vm.enrichedSongs[idx]
-                if let existingIndex = songs.firstIndex(where: { $0.localURL.path == song.localURL.path || $0.remoteFilename == song.remoteFilename }) {
-                    songs[existingIndex] = song
-                } else {
-                    songs.append(song)
-                }
-                status = "Updated metadata: \(song.title)"
-            }
-            handledEnrichedCount = newCount
-        }
         .onAppear {
             if searchProviderRaw == SearchProvider.tidal.rawValue || searchProviderRaw == SearchProvider.spotify.rawValue {
                 searchProviderRaw = SearchProvider.appleMusic.rawValue
             }
+            if searchProviderRaw == SearchProvider.metadata.rawValue {
+                searchProviderRaw = SearchProvider.itunes.rawValue
+            }
             vm.appDidBecomeActive()
-            Task { await vm.processDeferredEnrichmentIfNeeded() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-            vm.appDidBecomeActive()
-            Task { await vm.processDeferredEnrichmentIfNeeded() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("IncomingMusicLink"))) { notification in
             if let link = notification.object as? String {
@@ -1795,6 +1787,7 @@ struct BackendCandidate {
     let request: URLRequest?
     let tidalAPIBaseURL: String?
     let customDownload: ((_ trackID: String, _ suggestedName: String, _ fallbackExtension: String) async throws -> URL)?
+    var requestedFormat: String? = nil
 }
 
 struct BackendDownloadOutcome {
@@ -1808,88 +1801,11 @@ private struct PreparedBackgroundDownloadPlan {
     let fallbackExtension: String
 }
 
-enum DownloaderServerPreference: String, CaseIterable, Identifiable {
-    case auto
-    case byeTunesAPI
-    case yoinkify
-    case qobuz
-    case appleMusicAPI
-    case deezerAPI
-    case tidalAPI
-    case pandoraAPI
-    case amazonAPI
-    case soundCloudAPI
-    case youtubeAPI
-    case hifiOne
-    case hifiTwo
-
-    static var allCases: [DownloaderServerPreference] {
-        [.byeTunesAPI, .deezerAPI]
-    }
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .auto: return "Auto"
-        case .byeTunesAPI: return "ByeTunes API"
-        case .yoinkify: return "Yoinkify"
-        case .qobuz: return "Qobuz"
-        case .appleMusicAPI: return "Apple Music API"
-        case .deezerAPI: return "Deezer"
-        case .tidalAPI: return "Tidal API"
-        case .pandoraAPI: return "Pandora API"
-        case .amazonAPI: return "Amazon API"
-        case .soundCloudAPI: return "SoundCloud API"
-        case .youtubeAPI: return "YouTube API"
-        case .hifiOne: return "HiFi One"
-        case .hifiTwo: return "HiFi Two"
-        }
-    }
-
-    var isDirectProviderOnly: Bool {
-        switch self {
-        case .byeTunesAPI, .appleMusicAPI, .deezerAPI, .tidalAPI, .pandoraAPI, .amazonAPI, .soundCloudAPI, .youtubeAPI:
-            return true
-        case .auto, .yoinkify, .qobuz, .hifiOne, .hifiTwo:
-            return false
-        }
-    }
-}
-
-private enum DownloaderAutomaticQualityProfile: String {
-    case low
-    case medium
-    case high
-}
-
-private enum QobuzQualityProfile: String {
-    case lossless = "6"
-    case hiRes = "7"
-    case hiResMax = "27"
-}
-
 private enum TidalAPIRegistry {
     static let gistURL = "https://gist.githubusercontent.com/afkarxyz/2ce772b943321b9448b454f39403ce25/raw"
     static let cacheKey = "rotatingTidalAPIBaseURLs"
     static let lastUsedKey = "rotatingTidalAPILastUsedURL"
     static let defaultBaseURLs: [String] = []
-}
-
-private enum QobuzAPIRegistry {
-    static let searchBaseURLs = [
-        "https://api.zarz.moe/v1/qbz",
-        "https://api.zarz.moe/v1/qbz2"
-    ]
-
-    static let downloadProviders: [(label: String, url: String)] = [
-        ("Qobuz API (Zarz)", "https://api.zarz.moe/v1/dl/qbz")
-    ]
-}
-
-private struct QobuzSearchOutcome {
-    let trackIDs: [String]
-    let bestScore: Int
 }
 
 enum DownloadPlatform: String {
@@ -1941,33 +1857,9 @@ struct DownloadSourceChoice {
     let backendGenreSource: String
 }
 
-private struct DownloadMetadataFallbackMatch {
-    let title: String
-    let artist: String
-    let album: String?
-    let source: DownloadSourceChoice?
-    let providerName: String
-}
-
 private struct MetadataSearchBatch {
     let tracks: [DownloadTrack]
     let deezerCount: Int
-}
-
-private struct DeezerResolverCooldownPayload: Decodable {
-    let retry_after: Int?
-}
-
-private struct CachedDeezerDescriptor: Codable {
-    let downloadURL: String
-    let requiresClientDecryption: Bool
-    let fileFormat: String
-    let trackID: String?
-    let cachedAt: Date
-}
-
-private enum DeezerResolverPolicy {
-    static let maxAutomaticWaitSeconds = 210
 }
 
 private enum DirectLinkKind {
@@ -1983,6 +1875,11 @@ private enum DirectLinkKind {
     case spotifyAlbum(id: String, sourceURL: String)
     case spotifyArtist(id: String, sourceURL: String)
     case spotifyPlaylist(id: String, sourceURL: String)
+    case deezerTrack(id: String, sourceURL: String)
+    case deezerAlbum(id: String, sourceURL: String)
+    case deezerArtist(id: String, sourceURL: String)
+    case deezerPlaylist(id: String, sourceURL: String)
+    case deezerShortLink(sourceURL: String)
 }
 
 enum DownloadError: LocalizedError {
@@ -2016,6 +1913,23 @@ enum DownloadSupport {
         if type.contains("aac") || type.contains("mp4") { return "m4a" }
         if type.contains("wav") { return "wav" }
         return fallback
+    }
+
+    /// The file extension to fall back to when the response's `Content-Type` doesn't clearly say
+    /// what was delivered — must reflect what THIS candidate actually asked for, not a blanket
+    /// default. Every backend candidate hardcoded `"flac"` here regardless of its own
+    /// `requestedFormat`, so whenever the server's Content-Type was ambiguous, a track downloaded
+    /// through an "MP3 Fallback" candidate (or any non-FLAC request) still got saved with a
+    /// `.flac` extension — silently mislabeling the file everywhere the extension is trusted
+    /// (`audioFormatLabel`'s fallback path when codec inspection can't parse the mismatched
+    /// container, quality badges, etc.) even though the audio itself was correctly MP3.
+    static func fallbackExtension(forRequestedFormat format: String?, defaultingTo fallback: String) -> String {
+        guard let format else { return fallback }
+        switch format.lowercased() {
+        case "alac": return "m4a"
+        case "": return fallback
+        default: return format.lowercased()
+        }
     }
 
     static func tidyFilename(_ value: String) -> String {
@@ -2055,12 +1969,52 @@ enum DownloadSupport {
     }
 }
 
+/// Enforces a minimum gap between successive download starts, on top of (not instead of)
+/// `maxConcurrentDownloads` — mirrors ByeTunes's `DownloadGate`, added there after bursts of
+/// simultaneous requests were observed triggering backend 429/500s even while concurrency itself
+/// stayed within the cap. The backend reacts to burst rate, not just raw concurrency, so capping
+/// concurrency alone isn't sufficient insurance.
+///
+/// `minSpacing` is a per-call floor rather than a fixed value baked into `init` — lossless formats
+/// (FLAC/ALAC) are far more expensive for the backend to generate than MP3, so a burst of 3
+/// concurrent FLAC requests throttles the backend hard even at the same 300ms spacing that's fine
+/// for MP3 (confirmed: MusicManager and ByeTunes share the exact same backend and gate/pacer shape,
+/// but ByeTunes defaults to MP3 and doesn't see this). Callers pass a wider floor for lossless
+/// formats instead of this actor hardcoding format awareness itself.
+private actor DownloadStartPacer {
+    private let defaultMinSpacing: Duration
+    private var lastStart: ContinuousClock.Instant?
+
+    init(minSpacing: Duration) {
+        self.defaultMinSpacing = minSpacing
+    }
+
+    func waitForNextSlot(minSpacing: Duration? = nil) async {
+        let spacing = minSpacing ?? defaultMinSpacing
+        if let lastStart {
+            let elapsed = ContinuousClock.now - lastStart
+            if elapsed < spacing {
+                try? await Task.sleep(for: spacing - elapsed)
+            }
+        }
+        lastStart = ContinuousClock.now
+    }
+}
+
+private final class BackgroundTaskState {
+    var id: UIBackgroundTaskIdentifier = .invalid
+}
+
 @MainActor
 final class DownloadViewModel: ObservableObject {
-    private struct DeferredDownloadEnrichment {
-        let localURL: URL
-        let track: DownloadTrack
-    }
+    /// One instance for the whole app session — matching `DeviceManager.shared` /
+    /// `BackgroundAudioDownloadManager.shared` elsewhere in this codebase. Needed because
+    /// `LegacyTabBarView` (iOS <26) mounts `DownloadView` behind an `if selectedTab == ...`
+    /// branch (`TabViews.swift`), which tears down and recreates the view — and would recreate
+    /// a plain `DownloadViewModel()` with it, silently orphaning any in-flight foreground
+    /// download and losing the queue's live state. Referencing the shared instance instead means
+    /// `@StateObject` just re-observes the same object across that teardown/recreation.
+    static let shared = DownloadViewModel()
 
     @Published var artistResults: [DownloadArtist] = []
     @Published var songResults: [DownloadTrack] = []
@@ -2068,14 +2022,54 @@ final class DownloadViewModel: ObservableObject {
     @Published var playlistResults: [DownloadAlbum] = []
     @Published var pendingDirectLinkAction: DownloadDirectLinkAction?
     @Published var isPaused = false
-    private var queueTask: Task<Void, Never>?
+    private var foregroundWorkerTasks: [String: Task<Void, Never>] = [:]
+    /// Lossless formats (FLAC/ALAC) are far more expensive for the backend to generate than MP3 —
+    /// 3 concurrent lossless requests throttle the backend hard (confirmed against ByeTunes, which
+    /// shares this exact backend and gate/pacer shape but defaults to MP3 and doesn't see this), so
+    /// lossless downloads get a lower concurrency cap and wider start spacing (see
+    /// `downloadStartPacer` call sites) instead of a fixed value.
+    private var maxConcurrentDownloads: Int {
+        isLosslessDownloadFormat ? 2 : 3
+    }
+    private var isLosslessDownloadFormat: Bool {
+        let format = desiredDownloadFormat().lowercased()
+        return format == "flac" || format == "alac"
+    }
+    /// Whether the app is currently in the foreground. While active, transfers always run
+    /// through the in-process foreground path (`startForegroundWorker`) so all
+    /// `maxConcurrentDownloads` slots genuinely transfer bytes in parallel — the OS-managed
+    /// background session (`BackgroundAudioDownloadManager`) schedules its own tasks and won't
+    /// reliably run more than one real transfer at a time. The background session is reserved
+    /// for tracks still in flight once the app actually leaves the foreground.
+    ///
+    /// Was previously hardcoded `true` and only ever corrected by `DownloadView`'s own
+    /// `.onReceive` hooks for `UIApplication.didBecomeActive`/`didEnterBackground` — which never
+    /// fire if this view model is first created while the app is already backgrounded (e.g. a
+    /// silent relaunch just to service `handleEventsForBackgroundURLSession`, with the Download
+    /// tab never shown). Any download started or recovered in that state used the short foreground
+    /// timeout instead of the durable background `URLSession`, so it either fell back to a lower
+    /// quality format when the real one timed out, or stalled until the user reopened the app.
+    /// Seeding from the actual `UIApplication.applicationState` at init, and observing the
+    /// lifecycle notifications directly here instead of relying on the view, keeps this correct
+    /// regardless of whether any view is ever shown.
+    private var isAppActive = UIApplication.shared.applicationState != .background
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    /// Track IDs whose foreground worker was cancelled specifically to hand them off to the
+    /// background session (see `appDidEnterBackground`), as opposed to a user-initiated
+    /// pause/cancel — lets `runForegroundWorker`'s cancellation handler tell the two apart and
+    /// requeue only the handoff case.
+    private var pendingBackgroundHandoffTrackIDs: Set<String> = []
+    /// Shared between the foreground and background-native start paths — both ultimately hit the
+    /// same backend endpoint, so pacing needs to apply regardless of which path a given track's
+    /// download takes.
+    private let downloadStartPacer = DownloadStartPacer(minSpacing: .milliseconds(300))
 
     var shouldShowPauseButton: Bool {
-        !pendingQueue.isEmpty || activeDownloadTrackID != nil
+        !pendingQueue.isEmpty || !activeDownloadTrackIDs.isEmpty
     }
 
     var shouldShowCancelButton: Bool {
-        !pendingQueue.isEmpty || activeDownloadTrackID != nil || isPaused
+        !pendingQueue.isEmpty || !activeDownloadTrackIDs.isEmpty || isPaused
     }
     @Published var isSearching = false
     @Published var errorText: String?
@@ -2085,27 +2079,24 @@ final class DownloadViewModel: ObservableObject {
     @Published var isLoadingMoreSongs = false
     @Published var isLoadingMoreAlbums = false
     @Published var isLoadingMorePlaylists = false
-    @Published var activeDownloadTrackID: String?
+    @Published private(set) var activeDownloadTrackIDs: Set<String> = []
     @Published var activePreviewTrackID: String?
     @Published private(set) var previewLoadingTrackIDs: Set<String> = []
     @Published var emittedSongs: [SongMetadata] = []
-    @Published var enrichedSongs: [SongMetadata] = []
     @Published private(set) var totalQueueCount = 0
     @Published private(set) var completedQueueCount = 0
-    @Published private(set) var currentSongProgress: Double = 0
-    @Published private(set) var currentDownloadSpeedBps: Double = 0
+    @Published private(set) var downloadProgressByTrackID: [String: Double] = [:]
+    @Published private(set) var downloadSpeedByTrackID: [String: Double] = [:]
 
     private let session: URLSession = .shared
     private var pendingQueue: [DownloadTrack] = []
-    private var isProcessingQueue = false
     private var trackStates: [String: DownloadTrackState] = [:]
     private var trackFailureReasons: [String: String] = [:]
+    private var trackQualityNotes: [String: String] = [:]
     private var knownTracksByID: [String: DownloadTrack] = [:]
     private var queueOrder: [String] = []
     private var albumTrackIDs: [String: [String]] = [:]
-    private var deferredEnrichments: [DeferredDownloadEnrichment] = []
-    private var isProcessingDeferredEnrichments = false
-    private var restoredActiveTrackID: String?
+    private var restoredActiveTrackIDs: [String] = []
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     @Published private var resolvingAlbumIDs: Set<String> = []
     private var lastSearchQuery = ""
@@ -2143,7 +2134,14 @@ final class DownloadViewModel: ObservableObject {
 
     init() {
         restorePersistedQueue()
-        restoreDeferredEnrichments()
+        lifecycleObservers = [
+            NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.appDidBecomeActive()
+            },
+            NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.appDidEnterBackground()
+            }
+        ]
         if backgroundDownloadsEnabled {
             Task { await recoverBackgroundDownloadIfNeeded() }
         }
@@ -2154,7 +2152,22 @@ final class DownloadViewModel: ObservableObject {
         return Double(completedQueueCount) / Double(totalQueueCount)
     }
 
+    /// Overall batch progress across every currently-downloading track, including partial
+    /// credit for in-flight bytes — not any single track's own progress.
+    var aggregateDownloadProgress: Double {
+        guard totalQueueCount > 0 else { return 0 }
+        let activeCredit = downloadProgressByTrackID.values.reduce(0, +)
+        return min((Double(completedQueueCount) + activeCredit) / Double(totalQueueCount), 1)
+    }
+
+    var aggregateDownloadSpeedBps: Double {
+        downloadSpeedByTrackID.values.reduce(0, +)
+    }
+
     deinit {
+        for observer in lifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
         if let previewEndObserver {
             NotificationCenter.default.removeObserver(previewEndObserver)
         }
@@ -2165,23 +2178,19 @@ final class DownloadViewModel: ObservableObject {
             return "Paused"
         }
         guard totalQueueCount > 0 else { return "Apple Music Search" }
-        if let _ = activeDownloadTrackID, completedQueueCount < totalQueueCount {
-            return "\(completedQueueCount + 1)/\(totalQueueCount)"
+        if !activeDownloadTrackIDs.isEmpty, completedQueueCount < totalQueueCount {
+            return "\(min(completedQueueCount + activeDownloadTrackIDs.count, totalQueueCount))/\(totalQueueCount)"
         }
         return "\(completedQueueCount)/\(totalQueueCount)"
-    }
-
-    var shouldShowQueueIndicator: Bool {
-        isPaused || (totalQueueCount > 0 && (activeDownloadTrackID != nil || !pendingQueue.isEmpty || completedQueueCount < totalQueueCount))
     }
 
     var queueCounterText: String {
         if isPaused {
             return "Paused"
         }
-        guard totalQueueCount > 0 else { return "0/0" }
-        if activeDownloadTrackID != nil {
-            return "\(min(completedQueueCount + 1, totalQueueCount))/\(totalQueueCount)"
+        guard totalQueueCount > 0 else { return "Queue" }
+        if !activeDownloadTrackIDs.isEmpty {
+            return "\(min(completedQueueCount + activeDownloadTrackIDs.count, totalQueueCount))/\(totalQueueCount)"
         }
         return "\(min(completedQueueCount, totalQueueCount))/\(totalQueueCount)"
     }
@@ -2326,7 +2335,7 @@ final class DownloadViewModel: ObservableObject {
 
         let resolved: URL?
         switch track.provider {
-        case .appleMusic, .spotify, .metadata, .tidal:
+        case .appleMusic, .spotify, .metadata, .tidal, .itunes, .deezer:
             resolved = await resolveITunesPreviewURL(for: track)
         }
 
@@ -2365,16 +2374,11 @@ final class DownloadViewModel: ObservableObject {
     func pauseQueue() {
         guard !isPaused else { return }
         isPaused = true
-        queueTask?.cancel()
-        if let activeID = activeDownloadTrackID, let track = knownTracksByID[activeID] {
-            updateLiveActivity(
-                trackName: track.name,
-                artistName: track.artistLine,
-                progress: currentSongProgress,
-                queueText: queueCounterText,
-                speedBps: currentDownloadSpeedBps,
-                phase: .paused
-            )
+        for task in foregroundWorkerTasks.values {
+            task.cancel()
+        }
+        if !activeDownloadTrackIDs.isEmpty {
+            pushLiveActivityUpdate(phaseOverride: .paused)
         }
         log("Download queue paused by user.")
     }
@@ -2383,44 +2387,41 @@ final class DownloadViewModel: ObservableObject {
         guard isPaused else { return }
         isPaused = false
         log("Download queue resumed by user.")
-        if backgroundDownloadsEnabled {
-            startBackgroundQueueIfNeeded()
-        } else {
-            queueTask = Task { await processQueueIfNeeded() }
-        }
+        Task { await processQueueIfNeeded() }
     }
 
     func cancelQueue() {
-        queueTask?.cancel()
-        let activeIDToCancel = activeDownloadTrackID
-        let cancelledTrack = activeDownloadTrackID.flatMap { knownTracksByID[$0] }
+        for task in foregroundWorkerTasks.values {
+            task.cancel()
+        }
+        let activeIDsToCancel = activeDownloadTrackIDs
+        let cancelledTrack = activeIDsToCancel.first.flatMap { knownTracksByID[$0] }
         for track in pendingQueue {
             trackStates[track.id] = .idle
         }
         pendingQueue.removeAll()
-        if let activeID = activeDownloadTrackID {
+        for activeID in activeIDsToCancel {
             trackStates[activeID] = .idle
         }
-        activeDownloadTrackID = nil
+        activeDownloadTrackIDs.removeAll()
+        downloadProgressByTrackID.removeAll()
+        downloadSpeedByTrackID.removeAll()
         totalQueueCount = 0
         completedQueueCount = 0
-        currentSongProgress = 0
-        currentDownloadSpeedBps = 0
         isPaused = false
-        if let cancelledTrack {
-            endLiveActivity(
-                trackName: cancelledTrack.name,
-                artistName: cancelledTrack.artistLine,
-                queueText: "Cancelled",
-                phase: .cancelled
-            )
+        if cancelledTrack != nil {
+            endLiveActivityIfQueueFinished(finalPhase: .cancelled)
         } else {
             clearLiveActivity()
         }
-        if backgroundDownloadsEnabled, let activeIDToCancel {
-            cancelledBackgroundTrackIDs.insert(activeIDToCancel)
+        if backgroundDownloadsEnabled, !activeIDsToCancel.isEmpty {
+            for activeID in activeIDsToCancel {
+                cancelledBackgroundTrackIDs.insert(activeID)
+            }
             Task {
-                await BackgroundAudioDownloadManager.shared.cancelDownloads(forTrackID: activeIDToCancel)
+                for activeID in activeIDsToCancel {
+                    await BackgroundAudioDownloadManager.shared.cancelDownloads(forTrackID: activeID)
+                }
             }
         }
         log("Download queue cancelled and cleared by user.")
@@ -2476,7 +2477,17 @@ final class DownloadViewModel: ObservableObject {
             }
         case .tidal:
             return await fetchTidalAlbumTracks(for: album)
-        case .metadata:
+        case .metadata, .itunes, .deezer:
+            if let identifier = album.albumIdentifier,
+               identifier.hasPrefix("deezer-album-"),
+               let numericID = Int(identifier.dropFirst("deezer-album-".count)),
+               let albumDetail = await SongMetadata.fetchDeezerAlbum(id: numericID) {
+                let tracks = albumDetail.tracks.data.map { metadataTrack(from: $0) }
+                if !tracks.isEmpty {
+                    return tracks
+                }
+            }
+
             if let tracks = metadataAlbumTrackCache[album.id], !tracks.isEmpty {
                 return tracks
             }
@@ -2537,7 +2548,7 @@ final class DownloadViewModel: ObservableObject {
                     )
                 } ?? []
             }
-        case .tidal, .metadata:
+        case .tidal, .metadata, .itunes, .deezer:
             return []
         }
     }
@@ -2561,6 +2572,7 @@ final class DownloadViewModel: ObservableObject {
         guard let track = knownTracksByID[trackID] else { return }
         errorText = nil
         trackFailureReasons.removeValue(forKey: trackID)
+        trackQualityNotes.removeValue(forKey: trackID)
         _ = enqueueMany([track])
     }
 
@@ -2571,6 +2583,20 @@ final class DownloadViewModel: ObservableObject {
         queueOrder.removeAll { $0 == trackID }
         if totalQueueCount > completedQueueCount {
             totalQueueCount = max(0, totalQueueCount - 1)
+        }
+        syncQueuePersistence()
+    }
+
+    func clearAllFailed() {
+        let failedIDs = Set(queueOrder.filter { trackStates[$0] == .failed })
+        guard !failedIDs.isEmpty else { return }
+        for id in failedIDs {
+            trackStates.removeValue(forKey: id)
+            trackFailureReasons.removeValue(forKey: id)
+        }
+        queueOrder.removeAll { failedIDs.contains($0) }
+        if totalQueueCount > completedQueueCount {
+            totalQueueCount = max(completedQueueCount, totalQueueCount - failedIDs.count)
         }
         syncQueuePersistence()
     }
@@ -2839,6 +2865,64 @@ final class DownloadViewModel: ObservableObject {
             canLoadMoreSongs = songResults.count < metadataCachedSearchTracks.count || metadataCanFetchMoreDeezer
             canLoadMoreAlbums = albumResults.count < metadataCachedSearchAlbums.count || metadataCanFetchMoreDeezer
             canLoadMorePlaylists = false
+
+        case .itunes:
+            activeTidalSearchHost = nil
+            artistResults = []
+            tidalCachedSearchArtists = []
+            tidalCachedSearchTracks = []
+            tidalCachedSearchAlbums = []
+            tidalSearchItemsCache = []
+            tidalTotalItemCount = 0
+
+            let batch = await fetchMetadataSearchTracks(
+                query: trimmed,
+                limit: songPageSize,
+                deezerIndex: 0,
+                includeITunes: true,
+                includeDeezer: false
+            )
+            metadataCachedSearchTracks = uniqueTracks(batch.tracks)
+            metadataDeezerOffset = 0
+            metadataCanFetchMoreDeezer = false
+            metadataCachedSearchAlbums = buildMetadataAlbums(from: metadataCachedSearchTracks)
+            metadataCachedSearchPlaylists = []
+
+            songResults = Array(metadataCachedSearchTracks.prefix(songPageSize))
+            albumResults = Array(metadataCachedSearchAlbums.prefix(albumPageSize))
+            playlistResults = []
+            canLoadMoreSongs = false
+            canLoadMoreAlbums = false
+            canLoadMorePlaylists = false
+
+        case .deezer:
+            activeTidalSearchHost = nil
+            artistResults = []
+            tidalCachedSearchArtists = []
+            tidalCachedSearchTracks = []
+            tidalCachedSearchAlbums = []
+            tidalSearchItemsCache = []
+            tidalTotalItemCount = 0
+
+            let batch = await fetchMetadataSearchTracks(
+                query: trimmed,
+                limit: songPageSize,
+                deezerIndex: 0,
+                includeITunes: false,
+                includeDeezer: true
+            )
+            metadataCachedSearchTracks = uniqueTracks(batch.tracks)
+            metadataDeezerOffset = batch.deezerCount
+            metadataCanFetchMoreDeezer = batch.deezerCount == songPageSize
+            metadataCachedSearchAlbums = buildMetadataAlbums(from: metadataCachedSearchTracks)
+            metadataCachedSearchPlaylists = []
+
+            songResults = Array(metadataCachedSearchTracks.prefix(songPageSize))
+            albumResults = Array(metadataCachedSearchAlbums.prefix(albumPageSize))
+            playlistResults = []
+            canLoadMoreSongs = songResults.count < metadataCachedSearchTracks.count || metadataCanFetchMoreDeezer
+            canLoadMoreAlbums = albumResults.count < metadataCachedSearchAlbums.count || metadataCanFetchMoreDeezer
+            canLoadMorePlaylists = false
         }
     }
 
@@ -2909,6 +2993,16 @@ final class DownloadViewModel: ObservableObject {
             canLoadMoreAlbums = albumResults.count < tidalCachedSearchAlbums.count || tidalSearchItemsCache.count < tidalTotalItemCount
             canLoadMorePlaylists = false
         case .metadata:
+            await expandMetadataSearchCacheIfNeeded(minimumTrackCount: songResults.count + songPageSize)
+            let nextCount = min(songResults.count + songPageSize, metadataCachedSearchTracks.count)
+            songResults = Array(metadataCachedSearchTracks.prefix(nextCount))
+            albumResults = Array(metadataCachedSearchAlbums.prefix(max(albumResults.count, min(albumPageSize, metadataCachedSearchAlbums.count))))
+            canLoadMoreSongs = songResults.count < metadataCachedSearchTracks.count || metadataCanFetchMoreDeezer
+            canLoadMoreAlbums = albumResults.count < metadataCachedSearchAlbums.count || metadataCanFetchMoreDeezer
+            canLoadMorePlaylists = false
+        case .itunes:
+            canLoadMoreSongs = false
+        case .deezer:
             await expandMetadataSearchCacheIfNeeded(minimumTrackCount: songResults.count + songPageSize)
             let nextCount = min(songResults.count + songPageSize, metadataCachedSearchTracks.count)
             songResults = Array(metadataCachedSearchTracks.prefix(nextCount))
@@ -2988,6 +3082,15 @@ final class DownloadViewModel: ObservableObject {
             canLoadMoreSongs = songResults.count < metadataCachedSearchTracks.count || metadataCanFetchMoreDeezer
             canLoadMoreAlbums = albumResults.count < metadataCachedSearchAlbums.count || metadataCanFetchMoreDeezer
             canLoadMorePlaylists = false
+        case .itunes:
+            canLoadMoreAlbums = false
+        case .deezer:
+            let desiredAlbumCount = albumResults.count + albumPageSize
+            await expandMetadataSearchCacheIfNeeded(minimumAlbumCount: desiredAlbumCount)
+            albumResults = Array(metadataCachedSearchAlbums.prefix(min(desiredAlbumCount, metadataCachedSearchAlbums.count)))
+            canLoadMoreSongs = songResults.count < metadataCachedSearchTracks.count || metadataCanFetchMoreDeezer
+            canLoadMoreAlbums = albumResults.count < metadataCachedSearchAlbums.count || metadataCanFetchMoreDeezer
+            canLoadMorePlaylists = false
         }
     }
 
@@ -3037,7 +3140,7 @@ final class DownloadViewModel: ObservableObject {
                 !playlistResults.contains(where: { $0.id == incoming.id })
             })
             canLoadMorePlaylists = playlists.count == playlistPageSize
-        case .tidal, .metadata:
+        case .tidal, .metadata, .itunes, .deezer:
             canLoadMorePlaylists = false
         }
     }
@@ -3081,9 +3184,36 @@ final class DownloadViewModel: ObservableObject {
 
             return DownloadArtistProfile(tracks: tracks, albums: uniqueAlbums(mappedAlbums))
 
-        case .tidal, .metadata, .spotify:
+        case .tidal, .metadata, .spotify, .itunes, .deezer:
+            if artist.id.hasPrefix("deezer-artist-"),
+               let numericID = Int(artist.id.dropFirst("deezer-artist-".count)) {
+                let profile = await buildDeezerArtistProfile(id: numericID, fallbackName: artist.name)
+                if !profile.tracks.isEmpty || !profile.albums.isEmpty {
+                    return profile
+                }
+            }
             return await buildMetadataArtistProfile(for: artist.name)
         }
+    }
+
+    private func buildDeezerArtistProfile(id: Int, fallbackName: String) async -> DownloadArtistProfile {
+        async let topTracksResult = SongMetadata.fetchDeezerArtistTopTracks(id: id, limit: 100)
+        async let albumsResult = SongMetadata.fetchDeezerArtistAlbums(id: id, limit: 100)
+
+        let tracks = await topTracksResult.map { metadataTrack(from: $0) }
+        let albums = await albumsResult.map { summary in
+            DownloadAlbum(
+                id: "deezer-album-\(summary.id)",
+                name: summary.title,
+                artistLine: fallbackName,
+                artworkURL: URL(string: summary.cover_xl),
+                sourceURL: "https://www.deezer.com/album/\(summary.id)",
+                provider: .metadata,
+                artistIdentifier: "deezer-artist-\(id)",
+                albumIdentifier: "deezer-album-\(summary.id)"
+            )
+        }
+        return DownloadArtistProfile(tracks: tracks, albums: albums)
     }
 
     private func buildMetadataArtistProfile(for artistName: String) async -> DownloadArtistProfile {
@@ -3296,6 +3426,100 @@ final class DownloadViewModel: ObservableObject {
                 )
             )
             return true
+
+        case .deezerTrack(let id, let sourceURL):
+            guard let numericID = Int(id), let song = await SongMetadata.fetchDeezerTrack(id: numericID) else {
+                errorText = "Could not load that Deezer track link."
+                return true
+            }
+            let track = metadataTrack(from: song, sourceURLOverride: sourceURL)
+            pendingDirectLinkAction = DownloadDirectLinkAction(payload: .track(track))
+            return true
+
+        case .deezerAlbum(let id, let sourceURL):
+            guard let numericID = Int(id), let albumDetail = await SongMetadata.fetchDeezerAlbum(id: numericID) else {
+                errorText = "Could not load that Deezer album link."
+                return true
+            }
+            let tracks = albumDetail.tracks.data.map { metadataTrack(from: $0) }
+            guard let firstTrack = tracks.first else {
+                errorText = "Could not load that Deezer album link."
+                return true
+            }
+            let albumResult = DownloadAlbum(
+                id: firstTrack.albumIdentifier ?? "deezer-album-\(albumDetail.id)",
+                name: albumDetail.title,
+                artistLine: albumDetail.artist.name,
+                artworkURL: URL(string: albumDetail.cover_xl),
+                sourceURL: sourceURL,
+                provider: .metadata,
+                artistIdentifier: firstTrack.artistIdentifier,
+                albumIdentifier: firstTrack.albumIdentifier
+            )
+            albumTrackIDs[albumResult.id] = tracks.map(\.id)
+            pendingDirectLinkAction = DownloadDirectLinkAction(
+                payload: .collection(
+                    album: albumResult,
+                    tracks: tracks,
+                    title: "Album Download",
+                    helperText: "Choose the tracks you want to download, or grab the full album in one tap."
+                )
+            )
+            return true
+
+        case .deezerArtist(let id, _):
+            guard let numericID = Int(id), let artistDetail = await SongMetadata.fetchDeezerArtist(id: numericID) else {
+                errorText = "Could not load that Deezer artist link."
+                return true
+            }
+            let artist = DownloadArtist(
+                id: "deezer-artist-\(artistDetail.id)",
+                name: artistDetail.name,
+                provider: .metadata,
+                artworkURL: URL(string: artistDetail.picture_xl)
+            )
+            pendingDirectLinkAction = DownloadDirectLinkAction(payload: .artist(artist))
+            return true
+
+        case .deezerPlaylist(let id, let sourceURL):
+            guard let numericID = Int(id), let playlistDetail = await SongMetadata.fetchDeezerPlaylist(id: numericID) else {
+                errorText = "Could not load that Deezer playlist link."
+                return true
+            }
+            let tracks = playlistDetail.tracks.data.map { metadataTrack(from: $0) }
+            guard !tracks.isEmpty else {
+                errorText = "Could not load that Deezer playlist link."
+                return true
+            }
+            let playlistContainerID = "deezer-playlist-\(playlistDetail.id)"
+            let playlistContainer = DownloadAlbum(
+                id: playlistContainerID,
+                name: playlistDetail.title,
+                artistLine: playlistDetail.creator.name,
+                artworkURL: URL(string: playlistDetail.picture_xl),
+                sourceURL: sourceURL,
+                provider: .metadata,
+                artistIdentifier: nil,
+                albumIdentifier: playlistContainerID
+            )
+            albumTrackIDs[playlistContainerID] = tracks.map(\.id)
+            pendingDirectLinkAction = DownloadDirectLinkAction(
+                payload: .collection(
+                    album: playlistContainer,
+                    tracks: tracks,
+                    title: "Playlist Download",
+                    helperText: "Choose the songs you want to download, or grab the full playlist in one tap."
+                )
+            )
+            return true
+
+        case .deezerShortLink(let sourceURL):
+            if let resolvedURL = await resolveDeezerShortLink(sourceURL),
+               let mappedDeezerLink = parseDirectLink(from: resolvedURL) {
+                return await handleDirectLinkSearch(mappedDeezerLink)
+            }
+            errorText = "Could not resolve that Deezer link."
+            return true
         }
     }
 
@@ -3363,6 +3587,32 @@ final class DownloadViewModel: ObservableObject {
                !id.isEmpty {
                 return .spotifyPlaylist(id: id, sourceURL: sourceURL)
             }
+        } else if host.contains("deezer.page.link") || host == "link.deezer.com" {
+            return .deezerShortLink(sourceURL: sourceURL)
+        } else if host.contains("deezer.com") {
+            if let index = pathParts.firstIndex(of: "track"),
+               let id = pathParts.dropFirst(index + 1).first,
+               !id.isEmpty {
+                return .deezerTrack(id: id, sourceURL: sourceURL)
+            }
+
+            if let index = pathParts.firstIndex(of: "album"),
+               let id = pathParts.dropFirst(index + 1).first,
+               !id.isEmpty {
+                return .deezerAlbum(id: id, sourceURL: sourceURL)
+            }
+
+            if let index = pathParts.firstIndex(of: "artist"),
+               let id = pathParts.dropFirst(index + 1).first,
+               !id.isEmpty {
+                return .deezerArtist(id: id, sourceURL: sourceURL)
+            }
+
+            if let index = pathParts.firstIndex(of: "playlist"),
+               let id = pathParts.dropFirst(index + 1).first,
+               !id.isEmpty {
+                return .deezerPlaylist(id: id, sourceURL: sourceURL)
+            }
         }
 
         return nil
@@ -3374,6 +3624,22 @@ final class DownloadViewModel: ObservableObject {
             return false
         }
         return host.contains("tidal.com")
+    }
+
+    private func resolveDeezerShortLink(_ sourceURL: String) async -> String? {
+        guard let url = URL(string: sourceURL) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let finalURL = response.url, finalURL.host?.lowercased().contains("deezer.com") == true else {
+                return nil
+            }
+            return finalURL.absoluteString
+        } catch {
+            log("Deezer short link resolution failed: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     private func resolveMappedDirectLink(from sourceURL: String, platform: DownloadPlatform) async -> DirectLinkKind? {
@@ -3569,14 +3835,15 @@ final class DownloadViewModel: ObservableObject {
         query: String,
         limit: Int,
         deezerIndex: Int,
-        includeITunes: Bool
+        includeITunes: Bool,
+        includeDeezer: Bool = true
     ) async -> MetadataSearchBatch {
-        async let deezerResults = SongMetadata.searchDeezer(query: query, limit: limit, index: deezerIndex)
+        async let deezerResults = includeDeezer ? SongMetadata.searchDeezer(query: query, limit: limit, index: deezerIndex) : []
         async let iTunesResults = includeITunes ? SongMetadata.searchiTunes(query: query, limit: min(limit, 50)) : []
 
         let deezerSongs = await deezerResults
         let iTunesSongs = await iTunesResults
-        let tracks = iTunesSongs.compactMap(metadataTrack(from:)) + deezerSongs.map(metadataTrack(from:))
+        let tracks = iTunesSongs.compactMap(metadataTrack(from:)) + deezerSongs.map { self.metadataTrack(from: $0) }
         return MetadataSearchBatch(tracks: tracks, deezerCount: deezerSongs.count)
     }
 
@@ -3648,105 +3915,99 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
+    /// Tops up the foreground worker pool to `maxConcurrentDownloads`, starting a new worker
+    /// task per free slot. Safe to call repeatedly (e.g. after every enqueue and every worker
+    /// completion) — it's a no-op once capacity is full or the queue is empty.
     private func processQueueIfNeeded() async {
-        if backgroundDownloadsEnabled {
+        if backgroundDownloadsEnabled && !isAppActive {
             startBackgroundQueueIfNeeded()
             return
         }
         guard !isPaused else { return }
-        guard !isProcessingQueue else { return }
-        isProcessingQueue = true
-        log("Queue processing started. pending=\(pendingQueue.count) completed=\(completedQueueCount)/\(totalQueueCount)")
+
+        while activeDownloadTrackIDs.count < maxConcurrentDownloads, !pendingQueue.isEmpty {
+            let track = pendingQueue.removeFirst()
+            log("Dequeued track \(track.id) (\(track.name)) remaining=\(pendingQueue.count) active=\(activeDownloadTrackIDs.count + 1)/\(maxConcurrentDownloads)")
+            startForegroundWorker(for: track)
+        }
+    }
+
+    private func startForegroundWorker(for track: DownloadTrack) {
+        errorText = nil
+        activeDownloadTrackIDs.insert(track.id)
+        trackStates[track.id] = .downloading
+        downloadProgressByTrackID[track.id] = 0
+        downloadSpeedByTrackID[track.id] = 0
         beginBackgroundTaskIfNeeded()
-        defer {
-            isProcessingQueue = false
-            endBackgroundTaskIfNeeded()
-            log("Queue processing stopped. pending=\(pendingQueue.count) active=\(activeDownloadTrackID ?? "none") completed=\(completedQueueCount)/\(totalQueueCount)")
+        pushLiveActivityUpdate(phaseOverride: .preparing)
+        syncQueuePersistence()
+
+        let spacing: Duration = isLosslessDownloadFormat ? .milliseconds(900) : .milliseconds(300)
+        foregroundWorkerTasks[track.id] = Task { [weak self] in
+            await self?.downloadStartPacer.waitForNextSlot(minSpacing: spacing)
+            await self?.runForegroundWorker(track)
+        }
+    }
+
+    private func runForegroundWorker(_ track: DownloadTrack) async {
+        do {
+            let outcome = try await downloadWithFallbacks(track: track)
+            log("Download finished via \(outcome.backendLabel): \(outcome.fileURL.lastPathComponent)")
+            try await finalizeDownloadedTrack(fileURL: outcome.fileURL, track: track, backendLabel: outcome.backendLabel)
+        } catch {
+            if Task.isCancelled {
+                let isBackgroundHandoff = pendingBackgroundHandoffTrackIDs.remove(track.id) != nil
+                log(isBackgroundHandoff ? "Download cancelled for background handoff." : "Download cancelled/paused by user.")
+                trackStates[track.id] = .idle
+                if isPaused || isBackgroundHandoff {
+                    pendingQueue.insert(track, at: 0)
+                }
+                finishForegroundWorker(for: track.id, incrementCompleted: false)
+                if isPaused {
+                    pushLiveActivityUpdate(phaseOverride: .paused)
+                } else if !isBackgroundHandoff {
+                    endLiveActivityIfQueueFinished(finalPhase: .cancelled)
+                }
+                return
+            }
+            let message = downloadFailureMessage(for: track, error: error)
+            log("Download failed (\(error.localizedDescription)): \(message)")
+            errorText = message
+            trackFailureReasons[track.id] = message
+            trackStates[track.id] = .failed
+            finishForegroundWorker(for: track.id, incrementCompleted: true)
+            endLiveActivityIfQueueFinished(finalPhase: .failed)
+            return
         }
 
-        while !pendingQueue.isEmpty {
-            if Task.isCancelled || isPaused {
-                log("Queue loop interrupted. cancelled=\(Task.isCancelled) paused=\(isPaused)")
-                break
-            }
-            let track = pendingQueue.removeFirst()
-            log("Dequeued track \(track.id) (\(track.name)) remaining=\(pendingQueue.count)")
-            errorText = nil
-            activeDownloadTrackID = track.id
-            trackStates[track.id] = .downloading
-            currentSongProgress = 0
-            currentDownloadSpeedBps = 0
-            updateLiveActivity(
-                trackName: track.name,
-                artistName: track.artistLine,
-                progress: 0,
-                queueText: queueCounterText,
-                speedBps: 0,
-                phase: .preparing
-            )
-            syncQueuePersistence()
+        finishForegroundWorker(for: track.id, incrementCompleted: true)
+        endLiveActivityIfQueueFinished(finalPhase: .completed)
+    }
 
-            do {
-                let outcome = try await downloadWithFallbacks(track: track)
-                log("Download finished via \(outcome.backendLabel): \(outcome.fileURL.lastPathComponent)")
-                try await finalizeDownloadedTrack(fileURL: outcome.fileURL, track: track, backendLabel: outcome.backendLabel)
-            } catch {
-                if Task.isCancelled {
-                    log("Download cancelled/paused by user.")
-                    trackStates[track.id] = .idle
-                    if isPaused {
-                        pendingQueue.insert(track, at: 0)
-                        updateLiveActivity(
-                            trackName: track.name,
-                            artistName: track.artistLine,
-                            progress: currentSongProgress,
-                            queueText: queueCounterText,
-                            speedBps: currentDownloadSpeedBps,
-                            phase: .paused
-                        )
-                    } else {
-                        endLiveActivity(
-                            trackName: track.name,
-                            artistName: track.artistLine,
-                            queueText: queueCounterText,
-                            phase: .cancelled
-                        )
-                    }
-                    break
-                }
-                let message = downloadFailureMessage(for: track, error: error)
-                log("Download failed: \(message)")
-                errorText = message
-                trackFailureReasons[track.id] = message
-                trackStates[track.id] = .failed
-                endLiveActivity(
-                    trackName: track.name,
-                    artistName: track.artistLine,
-                    queueText: queueCounterText,
-                    phase: .failed
-                )
-            }
-
+    /// Shared teardown once a foreground worker's single track is done (however it ended) —
+    /// frees its slot in `activeDownloadTrackIDs` so `processQueueIfNeeded` can immediately
+    /// backfill it from `pendingQueue`.
+    private func finishForegroundWorker(for trackID: String, incrementCompleted: Bool) {
+        foregroundWorkerTasks[trackID] = nil
+        activeDownloadTrackIDs.remove(trackID)
+        downloadProgressByTrackID[trackID] = nil
+        downloadSpeedByTrackID[trackID] = nil
+        if incrementCompleted {
             completedQueueCount += 1
-            activeDownloadTrackID = nil
-            currentSongProgress = 0
-            currentDownloadSpeedBps = 0
-            if trackStates[track.id] == .done && pendingQueue.isEmpty {
-                endLiveActivity(
-                    trackName: track.name,
-                    artistName: track.artistLine,
-                    queueText: "\(completedQueueCount)/\(totalQueueCount)",
-                    phase: .completed
-                )
-            }
-            syncQueuePersistence()
+        }
+        if activeDownloadTrackIDs.isEmpty && pendingQueue.isEmpty {
+            endBackgroundTaskIfNeeded()
+        }
+        syncQueuePersistence()
+        if !isPaused {
+            Task { await processQueueIfNeeded() }
         }
     }
 
     private func startBackgroundQueueIfNeeded() {
         guard backgroundDownloadsEnabled else { return }
+        guard !isAppActive else { return }
         guard !isPaused else { return }
-        guard activeDownloadTrackID == nil else { return }
         guard !pendingQueue.isEmpty else { return }
         guard canAdvanceBackgroundQueueNow else {
             log("Background queue has pending tracks, but next track will wait until the app is active again.")
@@ -3754,32 +4015,39 @@ final class DownloadViewModel: ObservableObject {
             return
         }
 
-        let track = pendingQueue.removeFirst()
-        log("Starting background-native queue step for \(track.id) (\(track.name)) remaining=\(pendingQueue.count)")
-        errorText = nil
-        activeDownloadTrackID = track.id
-        trackStates[track.id] = .downloading
-        currentSongProgress = 0
-        currentDownloadSpeedBps = 0
-        updateLiveActivity(
-            trackName: track.name,
-            artistName: track.artistLine,
-            progress: 0,
-            queueText: queueCounterText,
-            speedBps: 0,
-            phase: .preparing
-        )
-        syncQueuePersistence()
-        primeBackgroundPreparation()
+        while activeDownloadTrackIDs.count < maxConcurrentDownloads, !pendingQueue.isEmpty {
+            let track = pendingQueue.removeFirst()
+            log("Starting background-native queue step for \(track.id) (\(track.name)) remaining=\(pendingQueue.count) active=\(activeDownloadTrackIDs.count + 1)/\(maxConcurrentDownloads)")
+            errorText = nil
+            activeDownloadTrackIDs.insert(track.id)
+            trackStates[track.id] = .downloading
+            downloadProgressByTrackID[track.id] = 0
+            downloadSpeedByTrackID[track.id] = 0
+            pushLiveActivityUpdate(phaseOverride: .preparing)
+            syncQueuePersistence()
+            primeBackgroundPreparation()
 
-        Task { await processBackgroundQueuedTrack(track) }
+            let spacing: Duration = isLosslessDownloadFormat ? .milliseconds(900) : .milliseconds(300)
+            Task { [weak self] in
+                await self?.downloadStartPacer.waitForNextSlot(minSpacing: spacing)
+                await self?.processBackgroundQueuedTrack(track)
+            }
+        }
     }
 
     private func processBackgroundQueuedTrack(_ track: DownloadTrack) async {
-        let localBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DownloadTrack-\(track.id)") {
+        let taskState = BackgroundTaskState()
+        taskState.id = UIApplication.shared.beginBackgroundTask(withName: "DownloadTrack-\(track.id)") {
+            guard taskState.id != .invalid else { return }
+            Logger.shared.log("[Download] Background task expired for \(track.id) while queue was active")
+            UIApplication.shared.endBackgroundTask(taskState.id)
+            taskState.id = .invalid
         }
         defer {
-            UIApplication.shared.endBackgroundTask(localBackgroundTaskID)
+            if taskState.id != .invalid {
+                UIApplication.shared.endBackgroundTask(taskState.id)
+                taskState.id = .invalid
+            }
         }
         do {
             let outcome: BackendDownloadOutcome
@@ -3811,76 +4079,48 @@ final class DownloadViewModel: ObservableObject {
                 trackStates[track.id] = .idle
                 if isPaused {
                     pendingQueue.insert(track, at: 0)
-                    updateLiveActivity(
-                        trackName: track.name,
-                        artistName: track.artistLine,
-                        progress: currentSongProgress,
-                        queueText: queueCounterText,
-                        speedBps: currentDownloadSpeedBps,
-                        phase: .paused
-                    )
-                } else {
-                    endLiveActivity(
-                        trackName: track.name,
-                        artistName: track.artistLine,
-                        queueText: queueCounterText,
-                        phase: .cancelled
-                    )
                 }
-                activeDownloadTrackID = nil
-                currentSongProgress = 0
-                currentDownloadSpeedBps = 0
+                clearActiveBackgroundTrack(track.id)
+                if isPaused {
+                    pushLiveActivityUpdate(phaseOverride: .paused)
+                } else {
+                    endLiveActivityIfQueueFinished(finalPhase: .cancelled)
+                }
                 syncQueuePersistence()
                 return
             }
 
             let message = downloadFailureMessage(for: track, error: error)
-            log("Background-native queue failed: \(message)")
+            log("Background-native queue failed (\(error.localizedDescription)): \(message)")
             errorText = message
             trackFailureReasons[track.id] = message
             trackStates[track.id] = .failed
-            endLiveActivity(
-                trackName: track.name,
-                artistName: track.artistLine,
-                queueText: queueCounterText,
-                phase: .failed
-            )
         }
 
         completedQueueCount += 1
+        clearActiveBackgroundTrack(track.id)
         if trackStates[track.id] == .done {
             await showDownloadCompletion(for: track, completedCount: completedQueueCount)
+        } else {
+            endLiveActivityIfQueueFinished(finalPhase: .failed)
         }
-        activeDownloadTrackID = nil
-        currentSongProgress = 0
-        currentDownloadSpeedBps = 0
         syncQueuePersistence()
         continueBackgroundQueueIfAllowed()
     }
 
+    private func clearActiveBackgroundTrack(_ trackID: String) {
+        activeDownloadTrackIDs.remove(trackID)
+        downloadProgressByTrackID[trackID] = nil
+        downloadSpeedByTrackID[trackID] = nil
+    }
+
     private func showDownloadCompletion(for track: DownloadTrack, completedCount: Int) async {
-        let queueText = "\(completedCount)/\(totalQueueCount)"
-        if completedCount >= totalQueueCount || pendingQueue.isEmpty {
-            let subtitle = BackgroundMetadataFetchManager.isEnabled
-                ? "Fetching metadata in ByeTunes"
-                : "Ready for metadata in ByeTunes"
-            endLiveActivity(
-                trackName: "All downloads complete",
-                artistName: subtitle,
-                queueText: queueText,
-                phase: .allCompleted
-            )
+        if completedCount >= totalQueueCount || (pendingQueue.isEmpty && activeDownloadTrackIDs.isEmpty) {
+            endLiveActivityIfQueueFinished(finalPhase: .allCompleted)
             return
         }
 
-        updateLiveActivity(
-            trackName: track.name,
-            artistName: track.artistLine,
-            progress: 1,
-            queueText: queueText,
-            speedBps: 0,
-            phase: .completed
-        )
+        pushLiveActivityUpdate(phaseOverride: .completed)
         try? await Task.sleep(nanoseconds: 900_000_000)
     }
 
@@ -3896,7 +4136,11 @@ final class DownloadViewModel: ObservableObject {
         guard !pendingQueue.isEmpty else { return }
         guard !isPaused else { return }
 
-        if canAdvanceBackgroundQueueNow {
+        if isAppActive {
+            // Foreground again — hand remaining queued tracks back to the concurrent
+            // in-process path instead of continuing to feed the background session.
+            Task { await processQueueIfNeeded() }
+        } else if canAdvanceBackgroundQueueNow {
             primeBackgroundPreparation()
             startBackgroundQueueIfNeeded()
         } else {
@@ -3906,9 +4150,23 @@ final class DownloadViewModel: ObservableObject {
     }
 
     func appDidBecomeActive() {
+        isAppActive = true
+        Task { await processQueueIfNeeded() }
+    }
+
+    func appDidEnterBackground() {
+        isAppActive = false
         guard backgroundDownloadsEnabled else { return }
-        primeBackgroundPreparation()
-        startBackgroundQueueIfNeeded()
+        guard !foregroundWorkerTasks.isEmpty else {
+            startBackgroundQueueIfNeeded()
+            return
+        }
+
+        log("App entered background with \(foregroundWorkerTasks.count) foreground download(s) in flight — handing off to background transfer.")
+        for (trackID, task) in foregroundWorkerTasks {
+            pendingBackgroundHandoffTrackIDs.insert(trackID)
+            task.cancel()
+        }
     }
 
     private func scheduleBackgroundPreparationIfNeeded(for track: DownloadTrack) {
@@ -3937,13 +4195,12 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func prepareBackgroundDownloadPlan(for track: DownloadTrack) async -> PreparedBackgroundDownloadPlan? {
-        let serverPreference: DownloaderServerPreference = .auto
         let suggestedName = "\(track.artistLine) - \(track.name)"
         let fallbackExtension = "flac"
 
         do {
-            let resolvedSource = await resolvedPrimaryDownloadSource(for: track, serverPreference: serverPreference)
-            let candidates = try await primaryCandidates(for: resolvedSource, serverPreference: serverPreference, track: track)
+            let resolvedSource = await resolvedPrimaryDownloadSource(for: track)
+            let candidates = try await primaryCandidates(for: resolvedSource, track: track)
             guard !candidates.isEmpty else {
                 log("Background preparation produced no candidates for \(track.id).")
                 return nil
@@ -3967,7 +4224,7 @@ final class DownloadViewModel: ObservableObject {
         let validTracks = tracks.filter { canEnqueue(trackID: $0.id) }
         guard !validTracks.isEmpty else { return 0 }
 
-        if totalQueueCount == completedQueueCount && activeDownloadTrackID == nil && pendingQueue.isEmpty {
+        if totalQueueCount == completedQueueCount && activeDownloadTrackIDs.isEmpty && pendingQueue.isEmpty {
             totalQueueCount = 0
             completedQueueCount = 0
         }
@@ -3985,81 +4242,16 @@ final class DownloadViewModel: ObservableObject {
 
         syncQueuePersistence()
         if !isPaused {
-            if backgroundDownloadsEnabled {
+            if backgroundDownloadsEnabled && !isAppActive {
                 primeBackgroundPreparation()
-                startBackgroundQueueIfNeeded()
-            } else {
-                queueTask = Task { await processQueueIfNeeded() }
             }
+            Task { await processQueueIfNeeded() }
         }
         return validTracks.count
     }
 
     private func enrichDownloadedSong(_ initialSong: SongMetadata, sourceTrack: DownloadTrack) async -> SongMetadata {
-        var song = initialSong
-
-        song = await SongMetadata.enrichWithExactAppleMusicTrack(song, trackID: sourceTrack.id, urlHint: sourceTrack.sourceURL)
-
-        if song.storeId == 0 {
-            song = await SongMetadata.enrichWithAppleMusicMetadata(song)
-        }
-
-        let appleSubscriptionLyrics = UserDefaults.standard.bool(forKey: "appleSubscriptionLyrics")
-        if !appleSubscriptionLyrics && (song.lyrics == nil || song.lyrics?.isEmpty == true) {
-            if let fetchedLyrics = await SongMetadata.fetchLyrics(
-                title: song.title,
-                artist: song.artist,
-                album: song.album,
-                durationMs: song.durationMs
-            ) {
-                song.lyrics = fetchedLyrics
-            }
-        }
-
-        return song
-    }
-
-    private func validateDownloadedSong(
-        _ song: SongMetadata,
-        sourceTrack: DownloadTrack,
-        backendLabel: String
-    ) async throws {
-        let isAMDL = backendLabel.localizedCaseInsensitiveContains("am-dl")
-        let isQobuz = backendLabel.localizedCaseInsensitiveContains("qobuz")
-        guard isAMDL || isQobuz else { return }
-
-        if song.fileSize < 32_768 {
-            log("\(backendLabel) validation failed for \(sourceTrack.id): file too small (\(song.fileSize) bytes)")
-            throw DownloadError.remoteFailure("\(backendLabel) did not return a full audio file.")
-        }
-
-        if !downloadedFileLooksLikeAudio(song.localURL) {
-            log("\(backendLabel) validation failed for \(sourceTrack.id): file signature does not match audio type at \(song.localURL.lastPathComponent)")
-            throw DownloadError.remoteFailure("\(backendLabel) returned an invalid audio file.")
-        }
-
-        if !downloadedFileCanBeDecoded(song.localURL) {
-            log("\(backendLabel) validation failed for \(sourceTrack.id): audio is not decodable at \(song.localURL.lastPathComponent) (\(song.fileSize) bytes)")
-            throw DownloadError.remoteFailure("\(backendLabel) returned unreadable audio data.")
-        }
-
-        guard isAMDL else { return }
-
-        if song.durationMs <= 0 {
-            log("AM-DL validation failed for \(sourceTrack.id): unreadable duration (\(song.durationMs) ms)")
-            throw DownloadError.remoteFailure("AM-DL returned an unreadable audio file.")
-        }
-
-        if let expectedSong = await AppleMusicAPI.shared.fetchSong(id: sourceTrack.id, urlHint: sourceTrack.sourceURL),
-           let expectedDurationMs = expectedSong.attributes.durationInMillis,
-           expectedDurationMs > 0 {
-            let deltaMs = abs(song.durationMs - expectedDurationMs)
-            let allowedDeltaMs = max(12_000, expectedDurationMs / 8)
-            if deltaMs > allowedDeltaMs {
-                log("AM-DL validation failed for \(sourceTrack.id): duration mismatch actual=\(song.durationMs) expected=\(expectedDurationMs) delta=\(deltaMs)")
-                throw DownloadError.remoteFailure("AM-DL returned media that does not match the expected song duration.")
-            }
-        }
+        await SongMetadata.enrichDownloadedSong(initialSong, sourceTrack: sourceTrack)
     }
 
     private func downloadedFileLooksLikeAudio(_ url: URL) -> Bool {
@@ -4118,24 +4310,26 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
-    private func downloadedFileCanBeDecoded(_ url: URL) -> Bool {
-        do {
-            let audioFile = try AVAudioFile(forReading: url)
-            return audioFile.length > 0 && audioFile.processingFormat.sampleRate > 0
-        } catch {
-            log("Download decode probe failed for \(url.lastPathComponent): \(error.localizedDescription)")
-            return false
-        }
-    }
-
     private func beginBackgroundTaskIfNeeded() {
         guard backgroundDownloadsEnabled else { return }
         guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DownloadQueue") {
+        let taskState = BackgroundTaskState()
+        taskState.id = UIApplication.shared.beginBackgroundTask(withName: "DownloadQueue") {
+            guard taskState.id != .invalid else { return }
             Logger.shared.log("[Download] Background task expired while queue was active")
+            let expiredID = taskState.id
+            UIApplication.shared.endBackgroundTask(expiredID)
+            taskState.id = .invalid
             Task { @MainActor [weak self] in
-                self?.endBackgroundTaskIfNeeded()
+                self?.clearBackgroundTaskID(expiredID)
             }
+        }
+        backgroundTaskID = taskState.id
+    }
+
+    private func clearBackgroundTaskID(_ id: UIBackgroundTaskIdentifier) {
+        if backgroundTaskID == id {
+            backgroundTaskID = .invalid
         }
     }
 
@@ -4164,10 +4358,9 @@ final class DownloadViewModel: ObservableObject {
         }
 
         var song = try await SongMetadata.fromURL(fileURL)
-        try await validateDownloadedSong(song, sourceTrack: track, backendLabel: backendLabel)
         if backgroundDownloadsEnabled {
             trackStates[track.id] = .done
-            handOffDownloadedFileForMainImport(song.localURL, trackID: track.id)
+            handOffDownloadedFileForMainImport(song.localURL, track: track)
             log("Queued downloaded file for main import pipeline: \(song.title) [\(track.id)]")
         } else {
             song = await enrichDownloadedSong(song, sourceTrack: track)
@@ -4180,60 +4373,51 @@ final class DownloadViewModel: ObservableObject {
 
     private func recoverBackgroundDownloadIfNeeded() async {
         guard backgroundDownloadsEnabled else {
-            if restoredActiveTrackID != nil {
+            if !restoredActiveTrackIDs.isEmpty {
                 log("Background download recovery skipped because background downloads are disabled.")
             }
-            restoredActiveTrackID = nil
+            restoredActiveTrackIDs = []
             return
         }
-        guard let activeID = restoredActiveTrackID else { return }
-        guard let track = knownTracksByID[activeID] else {
-            restoredActiveTrackID = nil
-            return
+        guard !restoredActiveTrackIDs.isEmpty else { return }
+
+        let idsToRecover = restoredActiveTrackIDs
+        restoredActiveTrackIDs = []
+        for activeID in idsToRecover {
+            await recoverSingleBackgroundDownload(activeID: activeID)
         }
+    }
 
-        let attached = await BackgroundAudioDownloadManager.shared.bindToActiveDownload(
-            forTrackID: activeID,
-            progress: { [weak self] progress, speedBps in
-                self?.updateVisibleDownloadProgress(progress, speedBps: speedBps)
-            },
-            completion: { [weak self] result in
-                guard let self else { return }
-                Task { await self.handleRecoveredBackgroundDownloadResult(result, for: track) }
-            }
-        )
+    private func recoverSingleBackgroundDownload(activeID: String) async {
+        guard let track = knownTracksByID[activeID] else { return }
 
-        restoredActiveTrackID = nil
+        let attached = await bindRecoveredBackgroundDownload(activeID: activeID, track: track)
 
         if attached {
-            activeDownloadTrackID = activeID
+            activeDownloadTrackIDs.insert(activeID)
             trackStates[activeID] = .downloading
-            currentSongProgress = 0
-            currentDownloadSpeedBps = 0
-            updateLiveActivity(
-                trackName: track.name,
-                artistName: track.artistLine,
-                progress: 0,
-                queueText: queueCounterText,
-                speedBps: 0,
-                phase: .downloading
-            )
+            downloadProgressByTrackID[activeID] = 0
+            downloadSpeedByTrackID[activeID] = 0
+            pushLiveActivityUpdate(phaseOverride: .downloading)
             log("Reattached to active background download for \(track.name).")
             syncQueuePersistence()
             return
         }
 
         try? await Task.sleep(nanoseconds: 2_000_000_000)
-        if await rebindRecoveredBackgroundDownload(activeID: activeID, track: track) {
+        if await bindRecoveredBackgroundDownload(activeID: activeID, track: track) {
+            activeDownloadTrackIDs.insert(activeID)
+            trackStates[activeID] = .downloading
+            downloadProgressByTrackID[activeID] = 0
+            downloadSpeedByTrackID[activeID] = 0
+            log("Reattached to active background download for \(track.name) after retry.")
+            syncQueuePersistence()
             return
         }
 
         if hasHandedOffDownloadedFile(trackID: activeID) {
             log("Recovered active download for \(track.name) was already handed off. Marking complete.")
             trackStates[activeID] = .done
-            activeDownloadTrackID = nil
-            currentSongProgress = 0
-            currentDownloadSpeedBps = 0
             completedQueueCount = min(completedQueueCount + 1, totalQueueCount)
             syncQueuePersistence()
             continueBackgroundQueueIfAllowed()
@@ -4249,32 +4433,22 @@ final class DownloadViewModel: ObservableObject {
             if backgroundDownloadsEnabled {
                 continueBackgroundQueueIfAllowed()
             } else {
-                queueTask = Task { await processQueueIfNeeded() }
+                Task { await processQueueIfNeeded() }
             }
         }
     }
 
-    private func rebindRecoveredBackgroundDownload(activeID: String, track: DownloadTrack) async -> Bool {
-        let attached = await BackgroundAudioDownloadManager.shared.bindToActiveDownload(
+    private func bindRecoveredBackgroundDownload(activeID: String, track: DownloadTrack) async -> Bool {
+        await BackgroundAudioDownloadManager.shared.bindToActiveDownload(
             forTrackID: activeID,
             progress: { [weak self] progress, speedBps in
-                self?.updateVisibleDownloadProgress(progress, speedBps: speedBps)
+                self?.updateVisibleDownloadProgress(progress, speedBps: speedBps, trackID: activeID)
             },
             completion: { [weak self] result in
                 guard let self else { return }
                 Task { await self.handleRecoveredBackgroundDownloadResult(result, for: track) }
             }
         )
-
-        guard attached else { return false }
-
-        activeDownloadTrackID = activeID
-        trackStates[activeID] = .downloading
-        currentSongProgress = 0
-        currentDownloadSpeedBps = 0
-        log("Reattached to active background download for \(track.name) after retry.")
-        syncQueuePersistence()
-        return true
     }
 
     private func handleRecoveredBackgroundDownloadResult(
@@ -4286,16 +4460,14 @@ final class DownloadViewModel: ObservableObject {
             do {
                 if recoveredBackgroundResultNeedsRetry(backgroundResult) {
                     log("Recovered background transfer for \(track.name) finished on an intermediate response. Requeueing track.")
-                    activeDownloadTrackID = nil
-                    currentSongProgress = 0
-                    currentDownloadSpeedBps = 0
+                    clearActiveBackgroundTrack(track.id)
                     trackStates[track.id] = .queued
                     pendingQueue.insert(track, at: 0)
                     syncQueuePersistence()
                     if backgroundDownloadsEnabled {
                         continueBackgroundQueueIfAllowed()
                     } else {
-                        queueTask = Task { await processQueueIfNeeded() }
+                        Task { await processQueueIfNeeded() }
                     }
                     return
                 }
@@ -4306,68 +4478,54 @@ final class DownloadViewModel: ObservableObject {
                     backendLabel: backgroundResult.context.backendLabel
                 )
                 completedQueueCount += 1
+                clearActiveBackgroundTrack(track.id)
                 if trackStates[track.id] == .done {
                     await showDownloadCompletion(for: track, completedCount: completedQueueCount)
+                } else {
+                    endLiveActivityIfQueueFinished(finalPhase: .failed)
                 }
-                activeDownloadTrackID = nil
-                currentSongProgress = 0
-                currentDownloadSpeedBps = 0
                 log("Recovered background download finished via \(backgroundResult.context.backendLabel): \(backgroundResult.fileURL.lastPathComponent)")
                 syncQueuePersistence()
                 if !pendingQueue.isEmpty {
                     if backgroundDownloadsEnabled {
                         continueBackgroundQueueIfAllowed()
                     } else {
-                        queueTask = Task { await processQueueIfNeeded() }
+                        Task { await processQueueIfNeeded() }
                     }
                 }
             } catch {
                 let message = downloadFailureMessage(for: track, error: error)
-                log("Recovered background download failed validation: \(message)")
+                log("Recovered background download failed validation (\(error.localizedDescription)): \(message)")
                 errorText = message
                 trackFailureReasons[track.id] = message
                 trackStates[track.id] = .failed
                 completedQueueCount += 1
-                activeDownloadTrackID = nil
-                currentSongProgress = 0
-                currentDownloadSpeedBps = 0
-                endLiveActivity(
-                    trackName: track.name,
-                    artistName: track.artistLine,
-                    queueText: queueCounterText,
-                    phase: .failed
-                )
+                clearActiveBackgroundTrack(track.id)
+                endLiveActivityIfQueueFinished(finalPhase: .failed)
                 syncQueuePersistence()
                 if !pendingQueue.isEmpty {
                     if backgroundDownloadsEnabled {
                         continueBackgroundQueueIfAllowed()
                     } else {
-                        queueTask = Task { await processQueueIfNeeded() }
+                        Task { await processQueueIfNeeded() }
                     }
                 }
             }
         case .failure(let error):
             let message = downloadFailureMessage(for: track, error: error)
-            log("Recovered background download failed: \(message)")
+            log("Recovered background download failed (\(error.localizedDescription)): \(message)")
             errorText = message
             trackFailureReasons[track.id] = message
             trackStates[track.id] = .failed
             completedQueueCount += 1
-            activeDownloadTrackID = nil
-            currentSongProgress = 0
-            currentDownloadSpeedBps = 0
-            endLiveActivity(
-                trackName: track.name,
-                artistName: track.artistLine,
-                queueText: queueCounterText,
-                phase: .failed
-            )
+            clearActiveBackgroundTrack(track.id)
+            endLiveActivityIfQueueFinished(finalPhase: .failed)
             syncQueuePersistence()
             if !pendingQueue.isEmpty {
                 if backgroundDownloadsEnabled {
                     continueBackgroundQueueIfAllowed()
                 } else {
-                    queueTask = Task { await processQueueIfNeeded() }
+                    Task { await processQueueIfNeeded() }
                 }
             }
         }
@@ -4382,11 +4540,10 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func downloadWithFallbacks(track: DownloadTrack) async throws -> BackendDownloadOutcome {
-        let serverPreference: DownloaderServerPreference = .auto
-        let resolvedSource = await resolvedPrimaryDownloadSource(for: track, serverPreference: serverPreference)
+        let resolvedSource = await resolvedPrimaryDownloadSource(for: track)
         log("Using source URL (\(resolvedSource.platform.displayName)): \(resolvedSource.url)")
 
-        let candidates = try await primaryCandidates(for: resolvedSource, serverPreference: serverPreference, track: track)
+        let candidates = try await primaryCandidates(for: resolvedSource, track: track)
         if !candidates.isEmpty {
             if let outcome = try await executeCandidatesUntilSuccess(
                 candidates,
@@ -4404,13 +4561,13 @@ final class DownloadViewModel: ObservableObject {
                 let seed = mappingSeedURL(for: track.sourceURL)
                 let spotifyURL = try await fetchMappedURL(for: seed, platform: .spotify)
                 log("Mapped to Spotify for last-resort retry: \(spotifyURL)")
-                
+
                 let spotifySource = DownloadSourceChoice(
                     platform: .spotify,
                     url: spotifyURL,
                     backendGenreSource: DownloadPlatform.spotify.backendGenreSource
                 )
-                let spotifyCandidates = try await primaryCandidates(for: spotifySource, serverPreference: serverPreference, track: track)
+                let spotifyCandidates = try await primaryCandidates(for: spotifySource, track: track)
                 if !spotifyCandidates.isEmpty {
                     if let outcome = try await executeCandidatesUntilSuccess(
                         spotifyCandidates,
@@ -4455,10 +4612,7 @@ final class DownloadViewModel: ObservableObject {
         return DownloadSourceChoice(platform: platform, url: sourceURL, backendGenreSource: platform.backendGenreSource)
     }
 
-    private func resolvedPrimaryDownloadSource(
-        for track: DownloadTrack,
-        serverPreference: DownloaderServerPreference
-    ) async -> DownloadSourceChoice {
+    private func resolvedPrimaryDownloadSource(for track: DownloadTrack) async -> DownloadSourceChoice {
         var source = preferredDownloadSource(for: track.sourceURL)
         if track.provider == .spotify && source.platform == .appleMusic {
             do {
@@ -4474,138 +4628,21 @@ final class DownloadViewModel: ObservableObject {
                 log("Failed to map Apple Music track \(track.name) to Spotify: \(error.localizedDescription)")
             }
         }
-        guard serverPreference == .deezerAPI,
-              let deezerSource = await resolvedDeezerFallbackSource(for: track, source: source) else {
-            return source
-        }
-        return deezerSource
-    }
-
-    private func resolvedDeezerFallbackSource(
-        for track: DownloadTrack,
-        source: DownloadSourceChoice
-    ) async -> DownloadSourceChoice? {
-        if let cached = cachedDeezerSourceURL(for: track.id) {
-            return DownloadSourceChoice(
-                platform: .deezer,
-                url: cached,
-                backendGenreSource: DownloadPlatform.deezer.backendGenreSource
-            )
-        }
-
-        if source.platform == .deezer {
-            cacheDeezerSourceURL(source.url, for: track.id)
-            return source
-        }
-
-        if let exactDeezerSource = await resolveExactDeezerSource(for: track, source: source) {
-            log("Mapped track to Deezer via exact metadata: \(exactDeezerSource.url)")
-            cacheDeezerSourceURL(exactDeezerSource.url, for: track.id)
-            return exactDeezerSource
-        }
-
-        do {
-            let mappedURL = try await fetchMappedURL(for: mappingSeedURL(for: track.sourceURL), platform: .deezer)
-            log("Mapped track to Deezer via Song.link: \(mappedURL)")
-            cacheDeezerSourceURL(mappedURL, for: track.id)
-            return DownloadSourceChoice(
-                platform: .deezer,
-                url: mappedURL,
-                backendGenreSource: DownloadPlatform.deezer.backendGenreSource
-            )
-        } catch {
-            log("Song.link Deezer mapping failed for \(track.name): \(error.localizedDescription)")
-        }
-
-        if let metadataFallback = await bestMetadataFallback(for: track),
-           let deezerSource = metadataFallback.source,
-           deezerSource.platform == .deezer {
-            log("Mapped track to Deezer via metadata fallback: \(deezerSource.url)")
-            cacheDeezerSourceURL(deezerSource.url, for: track.id)
-            return deezerSource
-        }
-
-        if let searchedDeezerSource = await resolveDeezerSource(for: track) {
-            log("Mapped track to Deezer via direct Deezer search: \(searchedDeezerSource.url)")
-            cacheDeezerSourceURL(searchedDeezerSource.url, for: track.id)
-            return searchedDeezerSource
-        }
-
-        return nil
+        return source
     }
 
     private func primaryCandidates(
         for source: DownloadSourceChoice,
-        serverPreference: DownloaderServerPreference,
         track: DownloadTrack? = nil
     ) async throws -> [BackendCandidate] {
-        var candidates: [BackendCandidate] = []
-        if (serverPreference == .auto || serverPreference == .byeTunesAPI) &&
-            (source.platform == .appleMusic || source.platform == .spotify || source.platform == .deezer || source.platform == .unknown) {
-            candidates.append(contentsOf: try await byeTunesCandidates(for: source, serverPreference: serverPreference, track: track))
+        guard source.platform == .appleMusic || source.platform == .spotify || source.platform == .deezer || source.platform == .unknown else {
+            return []
         }
-
-        if serverPreference == .yoinkify &&
-            (source.platform == .appleMusic || source.platform == .spotify || source.platform == .deezer || source.platform == .unknown) {
-            let pow = await yoinkProofOfWork()
-            let format = yoinkifyFormat(for: serverPreference)
-
-            if let url = URL(string: "https://yoinkify.com/api/download") {
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                var payload: [String: Any] = [
-                    "url": source.url,
-                    "format": format,
-                    "genreSource": source.backendGenreSource
-                ]
-                if let pow {
-                    payload["pow"] = pow
-                }
-                request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-                candidates.append(BackendCandidate(label: "Yoinkify", request: request, tidalAPIBaseURL: nil, customDownload: nil))
-            }
-        }
-
-        switch source.platform {
-        case .appleMusic:
-            if serverPreference == .appleMusicAPI {
-                candidates.append(contentsOf: try appleExtensionCandidates(for: source))
-            }
-        case .deezer:
-            if serverPreference == .deezerAPI {
-                candidates.append(contentsOf: try deezerExtensionCandidates(for: source))
-            }
-        case .tidal:
-            if serverPreference == .tidalAPI {
-                candidates.append(contentsOf: try tidalExtensionCandidates(for: source))
-            }
-        case .amazon:
-            if serverPreference == .amazonAPI {
-                candidates.append(contentsOf: amazonExtensionCandidates(for: source))
-            }
-        case .pandora:
-            if serverPreference == .pandoraAPI {
-                candidates.append(contentsOf: try pandoraExtensionCandidates(for: source))
-            }
-        case .soundcloud:
-            if serverPreference == .soundCloudAPI {
-                candidates.append(contentsOf: try cobaltExtensionCandidates(for: source, providerLabel: "SoundCloud API (Cobalt)"))
-            }
-        case .youtubeMusic:
-            if serverPreference == .youtubeAPI {
-                candidates.append(contentsOf: try cobaltExtensionCandidates(for: source, providerLabel: "YouTube API (Cobalt)"))
-            }
-        case .spotify, .qobuz, .unknown:
-            break
-        }
-
-        return candidates
+        return try await downloadBackendCandidates(for: source, track: track)
     }
 
-    private func byeTunesCandidates(
+    private func downloadBackendCandidates(
         for source: DownloadSourceChoice,
-        serverPreference: DownloaderServerPreference,
         track: DownloadTrack? = nil
     ) async throws -> [BackendCandidate] {
         let urlString = "\(Config.byeTunesApiUrl)/api/download"
@@ -4613,7 +4650,7 @@ final class DownloadViewModel: ObservableObject {
             throw DownloadError.invalidURL(urlString)
         }
 
-        let desiredFormat = yoinkifyFormat(for: serverPreference)
+        let desiredFormat = desiredDownloadFormat()
         let wantsSyncedLyrics =
             UserDefaults.standard.bool(forKey: "fetchLyrics") ||
             UserDefaults.standard.bool(forKey: "appleSubscriptionLyrics")
@@ -4628,41 +4665,34 @@ final class DownloadViewModel: ObservableObject {
                 "genreSource": source.backendGenreSource,
                 "syncedLyrics": wantsSyncedLyrics
             ])
-            return BackendCandidate(label: label, request: request, tidalAPIBaseURL: nil, customDownload: nil)
+            return BackendCandidate(label: label, request: request, tidalAPIBaseURL: nil, customDownload: nil, requestedFormat: format)
         }
 
-        var candidates = [try makeCandidate(label: "ByeTunes API", format: desiredFormat)]
+        var candidates = [try makeCandidate(label: Config.downloadBackendLabel, format: desiredFormat)]
         if desiredFormat.lowercased() != "mp3" {
-            candidates.append(try makeCandidate(label: "ByeTunes API (MP3 Fallback)", format: "mp3"))
+            candidates.append(try makeCandidate(label: "\(Config.downloadBackendLabel) (MP3 Fallback)", format: "mp3"))
         }
 
-        if source.platform == .appleMusic, let track {
+        if source.platform == .appleMusic, track != nil {
             var spotifyURL: String?
-
-            if spotifyURL == nil, let cachedDeezer = cachedDeezerSourceURL(for: track.id) {
-                if let mapped = try? await fetchMappedURL(for: cachedDeezer, platform: .spotify) {
-                    spotifyURL = mapped
-                    log("ByeTunes Spotify fallback: song.link Deezer→Spotify: \(mapped)")
-                }
-            }
 
             if spotifyURL == nil,
                let mapped = try? await fetchMappedURL(for: mappingSeedURL(for: source.url), platform: .spotify) {
                 spotifyURL = mapped
-                log("ByeTunes Spotify fallback: song.link AM→Spotify: \(mapped)")
+                log("Spotify fallback: song.link AM→Spotify: \(mapped)")
             }
 
             if spotifyURL == nil,
                let deezerMapped = try? await fetchMappedURL(for: mappingSeedURL(for: source.url), platform: .deezer),
                let mapped = try? await fetchMappedURL(for: deezerMapped, platform: .spotify) {
                 spotifyURL = mapped
-                log("ByeTunes Spotify fallback: song.link AM→Deezer→Spotify: \(mapped)")
+                log("Spotify fallback: song.link AM→Deezer→Spotify: \(mapped)")
             }
 
             if let spotifyURL {
-                candidates.append(try makeCandidate(label: "ByeTunes API (Spotify)", format: desiredFormat, overrideURL: spotifyURL))
+                candidates.append(try makeCandidate(label: "\(Config.downloadBackendLabel) (Spotify)", format: desiredFormat, overrideURL: spotifyURL))
                 if desiredFormat.lowercased() != "mp3" {
-                    candidates.append(try makeCandidate(label: "ByeTunes API (Spotify MP3 Fallback)", format: "mp3", overrideURL: spotifyURL))
+                    candidates.append(try makeCandidate(label: "\(Config.downloadBackendLabel) (Spotify MP3 Fallback)", format: "mp3", overrideURL: spotifyURL))
                 }
             }
         }
@@ -4670,889 +4700,8 @@ final class DownloadViewModel: ObservableObject {
         return candidates
     }
 
-    private func appleExtensionCandidates(for source: DownloadSourceChoice) throws -> [BackendCandidate] {
-        let codec = "alac"
-        let app2Payload = try JSONSerialization.data(withJSONObject: ["url": source.url, "codec": codec])
-        var candidates: [BackendCandidate] = []
-
-        if let request = makePOSTRequest(
-            label: "Apple Music API (app2)",
-            urlString: "https://api.zarz.moe/v1/dl/app2",
-            jsonBody: app2Payload
-        ) {
-            candidates.append(request)
-        }
-
-        candidates.append(
-            BackendCandidate(
-                label: "Apple Music API (app)",
-                request: nil,
-                tidalAPIBaseURL: nil,
-                customDownload: { [weak self] _, suggestedName, _ in
-                    guard let self else {
-                        throw DownloadError.remoteFailure("Apple Music queued downloader is unavailable.")
-                    }
-                    return try await self.runAppleQueuedDownload(sourceURL: source.url, codec: codec, suggestedName: suggestedName)
-                }
-            )
-        )
-
-        return candidates
-    }
-
-    private func deezerExtensionCandidates(for source: DownloadSourceChoice) throws -> [BackendCandidate] {
-        return [
-            BackendCandidate(
-                label: "Deezer API (Zarz)",
-                request: nil,
-                tidalAPIBaseURL: nil,
-                customDownload: { [weak self] _, suggestedName, _ in
-                    guard let self else {
-                        throw DownloadError.remoteFailure("Deezer downloader is unavailable.")
-                    }
-                    return try await self.runDeezerExtensionDownload(sourceURL: source.url, suggestedName: suggestedName)
-                }
-            )
-        ]
-    }
-
-    private func tidalExtensionCandidates(for source: DownloadSourceChoice) throws -> [BackendCandidate] {
-        let quality = tidalTrackQuality()
-        var candidates: [BackendCandidate] = []
-
-        if let trackID = DownloadSupport.tidalTrackID(from: source.url) {
-            let idPayload = try JSONSerialization.data(withJSONObject: [
-                "id": trackID,
-                "quality": quality
-            ])
-            if let request = makePOSTRequest(
-                label: "Tidal API (tid2)",
-                urlString: "https://api.zarz.moe/v1/dl/tid2",
-                jsonBody: idPayload
-            ) {
-                candidates.append(request)
-            }
-        }
-
-        let urlPayload = try JSONSerialization.data(withJSONObject: [
-            "url": source.url,
-            "quality": quality
-        ])
-        if let request = makePOSTRequest(
-            label: "Tidal API (tid)",
-            urlString: "https://api.zarz.moe/v1/dl/tid",
-            jsonBody: urlPayload
-        ) {
-            candidates.append(request)
-        }
-
-        return candidates
-    }
-
-    private func pandoraExtensionCandidates(for source: DownloadSourceChoice) throws -> [BackendCandidate] {
-        let payload = try JSONSerialization.data(withJSONObject: ["url": pandoraResolverInput(from: source.url)])
-        return [
-            makePOSTRequest(
-                label: "Pandora API (Zarz)",
-                urlString: "https://api.zarz.moe/v1/dl/pan",
-                jsonBody: payload
-            )
-        ].compactMap { $0 }
-    }
-
-    private func amazonExtensionCandidates(for source: DownloadSourceChoice) -> [BackendCandidate] {
-        guard let asin = amazonASIN(from: source.url) else { return [] }
-        return [
-            makeRequest(
-                label: "Amazon Music API (Zarz)",
-                urlString: "https://api.zarz.moe/v1/dl/amazeamazeamaze/media?asin=\(asin)&codec=flac"
-            )
-        ].compactMap { $0 }
-    }
-
-    private func cobaltExtensionCandidates(for source: DownloadSourceChoice, providerLabel: String) throws -> [BackendCandidate] {
-        let payload = try JSONSerialization.data(withJSONObject: [
-            "url": source.url,
-            "downloadMode": "audio",
-            "audioFormat": "best"
-        ])
-        return [
-            makePOSTRequest(
-                label: providerLabel,
-                urlString: "https://api.zarz.moe/v1/dl/cobalt",
-                jsonBody: payload
-            )
-        ].compactMap { $0 }
-    }
-
-    private func runAppleQueuedDownload(sourceURL: String, codec: String, suggestedName: String) async throws -> URL {
-        guard let startURL = URL(string: "https://api.zarz.moe/v1/dl/app/download") else {
-            throw DownloadError.invalidURL("https://api.zarz.moe/v1/dl/app/download")
-        }
-
-        var startRequest = URLRequest(url: startURL)
-        startRequest.httpMethod = "POST"
-        applyZarzHeaders(to: &startRequest)
-        startRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        startRequest.httpBody = try JSONSerialization.data(withJSONObject: [
-            "url": sourceURL,
-            "codec": codec
-        ])
-
-        let startObject = try await performJSONObjectRequest(startRequest)
-        if let immediateURL = extractProviderDownloadURL(from: startObject) {
-            return try await executeDownloadRequest(
-                URLRequest(url: immediateURL),
-                trackID: sourceURL,
-                backendLabel: "Apple Music API",
-                suggestedName: suggestedName,
-                fallbackExtension: "m4a"
-            )
-        }
-
-        guard let jobID = findFirstString(in: startObject, matching: ["job_id", "jobId", "id"]), !jobID.isEmpty else {
-            throw DownloadError.remoteFailure("Apple Music queued download did not return a job ID.")
-        }
-
-        for _ in 0..<40 {
-            try await Task.sleep(nanoseconds: 1_500_000_000)
-
-            guard let statusURL = URL(string: "https://api.zarz.moe/v1/dl/app/status/\(jobID)") else {
-                throw DownloadError.invalidURL("https://api.zarz.moe/v1/dl/app/status/\(jobID)")
-            }
-            var statusRequest = URLRequest(url: statusURL)
-            applyZarzHeaders(to: &statusRequest)
-            let statusObject = try await performJSONObjectRequest(statusRequest)
-
-            if let resolvedURL = extractProviderDownloadURL(from: statusObject) {
-                return try await executeDownloadRequest(
-                    URLRequest(url: resolvedURL),
-                    trackID: sourceURL,
-                    backendLabel: "Apple Music API",
-                    suggestedName: suggestedName,
-                    fallbackExtension: "m4a"
-                )
-            }
-
-            if let status = findFirstString(in: statusObject, matching: ["status", "state"])?.lowercased(),
-               status.contains("failed") || status.contains("error") {
-                throw DownloadError.remoteFailure("Apple Music queued download failed with status '\(status)'.")
-            }
-
-            if let ready = findFirstString(in: statusObject, matching: ["status", "state"])?.lowercased(),
-               ready.contains("complete") || ready.contains("completed") || ready.contains("success") || ready.contains("done") {
-                break
-            }
-        }
-
-        guard let fileURL = URL(string: "https://api.zarz.moe/v1/dl/app/file/\(jobID)") else {
-            throw DownloadError.invalidURL("https://api.zarz.moe/v1/dl/app/file/\(jobID)")
-        }
-        var fileRequest = URLRequest(url: fileURL)
-        applyZarzHeaders(to: &fileRequest)
-        return try await executeDownloadRequest(
-            fileRequest,
-            trackID: sourceURL,
-            backendLabel: "Apple Music API",
-            suggestedName: suggestedName,
-            fallbackExtension: "m4a"
-        )
-    }
-
-    private func performJSONObjectRequest(_ request: URLRequest) async throws -> [String: Any] {
-        let (data, response) = try await session.data(for: request)
-        try validateHTTP(response: response, data: data)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            let bodyText = String(data: data, encoding: .utf8) ?? "<non-utf8 body>"
-            throw DownloadError.remoteFailure(bodyText)
-        }
-        return object
-    }
-
-    private func runDeezerExtensionDownload(sourceURL: String, suggestedName: String) async throws -> URL {
-        if let cachedDescriptor = cachedDeezerDescriptor(for: sourceURL) {
-            do {
-                let fileURL = try await downloadDeezerDescriptor(cachedDescriptor, suggestedName: suggestedName)
-                log("Reused cached Deezer stream URL for \(suggestedName)")
-                return fileURL
-            } catch {
-                clearCachedDeezerDescriptor(for: sourceURL)
-                log("Cached Deezer stream URL failed for \(suggestedName): \(error.localizedDescription)")
-            }
-        }
-
-        guard let resolverURL = URL(string: "https://api.zarz.moe/v1/dl/dzr") else {
-            throw DownloadError.invalidURL("https://api.zarz.moe/v1/dl/dzr")
-        }
-
-        var request = URLRequest(url: resolverURL)
-        request.httpMethod = "POST"
-        applyZarzHeaders(to: &request)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "platform": "deezer",
-            "url": sourceURL
-        ])
-
-        let descriptor = try await performRetryingDeezerResolverRequest(request)
-        cacheDeezerDescriptor(descriptor, for: sourceURL)
-        return try await downloadDeezerDescriptor(descriptor, suggestedName: suggestedName, fallbackTrackID: deezerTrackID(from: sourceURL))
-    }
-
-    private func downloadDeezerDescriptor(
-        _ descriptor: [String: Any],
-        suggestedName: String,
-        fallbackTrackID: String? = nil
-    ) async throws -> URL {
-        guard let downloadURL = extractProviderDownloadURL(from: descriptor) else {
-            throw DownloadError.remoteFailure("Deezer resolver did not return a download URL.")
-        }
-
-        let downloadRequest = URLRequest(url: downloadURL)
-        let (encryptedData, response) = try await fetchDataWithProgress(for: downloadRequest) { [weak self] progress, speedBps in
-            self?.updateVisibleDownloadProgress(progress, speedBps: speedBps)
-        }
-        try validateHTTP(response: response, data: encryptedData)
-
-        let requiresDecryption = findFirstBool(in: descriptor, matching: ["requires_client_decryption", "deezer_encrypted"]) ?? false
-        let fileFormat = (findFirstString(in: descriptor, matching: ["deezer_format", "format"]) ?? "flac").lowercased()
-        let decryptedData: Data
-        if requiresDecryption {
-            let trackID = findFirstString(in: descriptor, matching: ["deezer_track_id", "track_id"]) ?? fallbackTrackID
-            guard let trackID, let blowfishKey = deezerBlowfishKey(for: trackID) else {
-                throw DownloadError.remoteFailure("Deezer download requires decryption, but no track key could be derived.")
-            }
-            decryptedData = try decryptDeezerStream(encryptedData, key: blowfishKey)
-        } else {
-            decryptedData = encryptedData
-        }
-
-        let mimeType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
-        let fileExtension = deezerFileExtension(format: fileFormat, mimeType: mimeType)
-        return try saveDownloadedData(decryptedData, suggestedName: suggestedName, fileExtension: fileExtension)
-    }
-
-    private func performRetryingDeezerResolverRequest(_ request: URLRequest) async throws -> [String: Any] {
-        let deadline = Date().addingTimeInterval(TimeInterval(DeezerResolverPolicy.maxAutomaticWaitSeconds))
-        var lastError: Error?
-
-        resolverWindow: while Date() < deadline {
-            if let cooldown = deezerResolverCooldownRemaining() {
-                let remainingWindow = max(1, Int(ceil(deadline.timeIntervalSinceNow)))
-                let waitSeconds = min(cooldown, remainingWindow)
-                log("Waiting \(waitSeconds)s for Deezer resolver cooldown before retrying.")
-                try await Task.sleep(nanoseconds: UInt64(waitSeconds) * 1_000_000_000)
-                continue
-            }
-
-            resolverAttempts: for attempt in 1...3 {
-                do {
-                    return try await performJSONObjectRequest(request)
-                } catch {
-                    lastError = error
-                    if let retryAfter = deezerRetryAfterSeconds(from: error) {
-                        rememberDeezerResolverCooldown(seconds: retryAfter)
-                        continue resolverWindow
-                    }
-                    guard attempt < 3, isRetryableDeezerResolverError(error) else {
-                        throw error
-                    }
-                    log("Retrying Deezer resolver after transient failure (\(attempt)/3): \(error.localizedDescription)")
-                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 750_000_000)
-                }
-            }
-        }
-
-        if let cooldown = deezerResolverCooldownRemaining(), cooldown > 0 {
-            throw DownloadError.mappingFailed("Deezer stayed overloaded for several minutes. Try again a bit later.")
-        }
-
-        throw lastError ?? DownloadError.remoteFailure("Deezer resolver failed.")
-    }
-
-    private func deezerRetryAfterSeconds(from error: Error) -> Int? {
-        guard case let DownloadError.httpError(code, body) = error, code == 429 || (500...504).contains(code) else {
-            return nil
-        }
-
-        guard let data = body.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(DeezerResolverCooldownPayload.self, from: data),
-              let retryAfter = payload.retry_after,
-              retryAfter > 0 else {
-            return nil
-        }
-        return retryAfter
-    }
-
-    private func isRetryableDeezerResolverError(_ error: Error) -> Bool {
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .networkConnectionLost, .notConnectedToInternet:
-                return true
-            default:
-                break
-            }
-        }
-
-        guard case let DownloadError.httpError(code, _) = error else {
-            return false
-        }
-        return code == 429 || (500...504).contains(code)
-    }
-
-    private func cacheDeezerSourceURL(_ url: String, for trackID: String) {
-        guard !trackID.isEmpty, !url.isEmpty else { return }
-        UserDefaults.standard.set(url, forKey: "deezerSourceURL.\(trackID)")
-    }
-
-    private func cachedDeezerSourceURL(for trackID: String) -> String? {
-        guard !trackID.isEmpty else { return nil }
-        return UserDefaults.standard.string(forKey: "deezerSourceURL.\(trackID)")
-    }
-
-    private func cacheDeezerDescriptor(_ descriptor: [String: Any], for sourceURL: String) {
-        guard !sourceURL.isEmpty,
-              let downloadURL = extractProviderDownloadURL(from: descriptor)?.absoluteString else { return }
-
-        let payload = CachedDeezerDescriptor(
-            downloadURL: downloadURL,
-            requiresClientDecryption: findFirstBool(in: descriptor, matching: ["requires_client_decryption", "deezer_encrypted"]) ?? false,
-            fileFormat: (findFirstString(in: descriptor, matching: ["deezer_format", "format"]) ?? "flac").lowercased(),
-            trackID: findFirstString(in: descriptor, matching: ["deezer_track_id", "track_id"]) ?? deezerTrackID(from: sourceURL),
-            cachedAt: Date()
-        )
-
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        UserDefaults.standard.set(data, forKey: "deezerDescriptor.\(sourceURL)")
-    }
-
-    private func cachedDeezerDescriptor(for sourceURL: String) -> [String: Any]? {
-        guard !sourceURL.isEmpty,
-              let data = UserDefaults.standard.data(forKey: "deezerDescriptor.\(sourceURL)"),
-              let payload = try? JSONDecoder().decode(CachedDeezerDescriptor.self, from: data) else {
-            return nil
-        }
-
-        if Date().timeIntervalSince(payload.cachedAt) > 900 {
-            clearCachedDeezerDescriptor(for: sourceURL)
-            return nil
-        }
-
-        var descriptor: [String: Any] = [
-            "direct_download_url": payload.downloadURL,
-            "download_url": payload.downloadURL,
-            "requires_client_decryption": payload.requiresClientDecryption,
-            "deezer_format": payload.fileFormat
-        ]
-        if let trackID = payload.trackID, !trackID.isEmpty {
-            descriptor["track_id"] = trackID
-            descriptor["deezer_track_id"] = trackID
-        }
-        return descriptor
-    }
-
-    private func clearCachedDeezerDescriptor(for sourceURL: String) {
-        guard !sourceURL.isEmpty else { return }
-        UserDefaults.standard.removeObject(forKey: "deezerDescriptor.\(sourceURL)")
-    }
-
-    private func rememberDeezerResolverCooldown(seconds: Int) {
-        let safeSeconds = max(seconds, 1)
-        let until = Date().addingTimeInterval(TimeInterval(safeSeconds))
-        UserDefaults.standard.set(until, forKey: "deezerResolverCooldownUntil")
-    }
-
-    private func deezerResolverCooldownRemaining() -> Int? {
-        guard let until = UserDefaults.standard.object(forKey: "deezerResolverCooldownUntil") as? Date else {
-            return nil
-        }
-        let remaining = Int(ceil(until.timeIntervalSinceNow))
-        return remaining > 0 ? remaining : nil
-    }
-
-    private func amazonASIN(from urlString: String) -> String? {
-        let patterns = [
-            #"/([A-Z0-9]{10})(?:[/?]|$)"#,
-            #"asin=([A-Z0-9]{10})(?:[&]|$)"#
-        ]
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern),
-               let match = regex.firstMatch(in: urlString, range: NSRange(location: 0, length: urlString.utf16.count)),
-               let range = Range(match.range(at: 1), in: urlString) {
-                return String(urlString[range])
-            }
-        }
-        return nil
-    }
-
-    private func pandoraResolverInput(from urlString: String) -> String {
-        guard let tokenRange = urlString.range(of: #"/(TR[A-Za-z0-9]+)"#, options: .regularExpression) else {
-            return urlString
-        }
-
-        let token = String(urlString[tokenRange]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let match = token.range(of: #"^([A-Za-z]+)(\d+)"#, options: .regularExpression) else {
-            return urlString
-        }
-
-        let prefixDigits = String(token[match])
-        let letters = prefixDigits.prefix { $0.isLetter }
-        let digits = prefixDigits.drop { $0.isLetter }
-        guard !letters.isEmpty, !digits.isEmpty else { return urlString }
-        return "\(letters):\(digits)"
-    }
-
-    private func deezerTrackID(from urlString: String) -> String? {
-        guard let range = urlString.range(of: "/track/") else { return nil }
-        let tail = urlString[range.upperBound...]
-        let value = tail.split(separator: "?").first?.split(separator: "/").first.map(String.init) ?? ""
-        return value.isEmpty ? nil : value
-    }
-
-    private func deezerFileExtension(format: String, mimeType: String?) -> String {
-        if format.contains("flac") { return "flac" }
-        if format.contains("mp3") { return "mp3" }
-        return DownloadSupport.fileExtension(for: mimeType, fallback: "flac")
-    }
-
-    private func deezerBlowfishKey(for trackID: String) -> Data? {
-        let digest = Insecure.MD5.hash(data: Data(trackID.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        let secret = Array("g4el58wc0zvf9na1".utf8)
-        let md5Bytes = Array(hex.utf8)
-        guard md5Bytes.count >= 32, secret.count == 16 else { return nil }
-
-        var keyBytes = [UInt8]()
-        keyBytes.reserveCapacity(16)
-        for index in 0..<16 {
-            keyBytes.append(md5Bytes[index] ^ md5Bytes[index + 16] ^ secret[index])
-        }
-        return Data(keyBytes)
-    }
-
-    private func decryptDeezerStream(_ encryptedData: Data, key: Data) throws -> Data {
-        let chunkSize = 2048
-        let iv = Data([0, 1, 2, 3, 4, 5, 6, 7])
-        var output = Data(capacity: encryptedData.count)
-        var offset = 0
-        var chunkIndex = 0
-
-        while offset < encryptedData.count {
-            let end = min(offset + chunkSize, encryptedData.count)
-            let chunk = encryptedData[offset..<end]
-
-            if chunkIndex % 3 == 0 && chunk.count == chunkSize {
-                output.append(try blowfishCBCDecrypt(Data(chunk), key: key, iv: iv))
-            } else {
-                output.append(chunk)
-            }
-
-            offset = end
-            chunkIndex += 1
-        }
-
-        return output
-    }
-
-    private func blowfishCBCDecrypt(_ data: Data, key: Data, iv: Data) throws -> Data {
-        var outLength = 0
-        var outData = Data(count: data.count + kCCBlockSizeBlowfish)
-        let outCapacity = outData.count
-        let status = outData.withUnsafeMutableBytes { outBytes in
-            data.withUnsafeBytes { dataBytes in
-                key.withUnsafeBytes { keyBytes in
-                    iv.withUnsafeBytes { ivBytes in
-                        CCCrypt(
-                            CCOperation(kCCDecrypt),
-                            CCAlgorithm(kCCAlgorithmBlowfish),
-                            CCOptions(0),
-                            keyBytes.baseAddress,
-                            key.count,
-                            ivBytes.baseAddress,
-                            dataBytes.baseAddress,
-                            data.count,
-                            outBytes.baseAddress,
-                            outCapacity,
-                            &outLength
-                        )
-                    }
-                }
-            }
-        }
-
-        guard status == kCCSuccess else {
-            throw DownloadError.remoteFailure("Deezer Blowfish decryption failed (\(status)).")
-        }
-
-        outData.count = outLength
-        return outData
-    }
-
-    private func scoreAppleMusicCandidate(_ candidate: AppleMusicAPI.AppleMusicSong, for track: DownloadTrack) -> Int {
-        let trackTitle = DownloadSupport.normalizedSearchValue(track.name)
-        let trackAlbum = DownloadSupport.normalizedSearchValue(track.albumName)
-        let candidateTitle = DownloadSupport.normalizedSearchValue(candidate.attributes.name)
-        let candidateAlbum = DownloadSupport.normalizedSearchValue(candidate.attributes.albumName ?? "")
-        let candidateArtists = DownloadSupport.artistTokens(from: candidate.attributes.artistName)
-        let sourceArtists = DownloadSupport.artistTokens(from: track.artistLine)
-
-        var score = 0
-
-        if candidateTitle == trackTitle {
-            score += 140
-        } else if candidateTitle.contains(trackTitle) || trackTitle.contains(candidateTitle) {
-            score += 95
-        }
-
-        for artist in sourceArtists {
-            if candidateArtists.contains(artist) {
-                score += 35
-            } else if candidateArtists.contains(where: { $0.contains(artist) || artist.contains($0) }) {
-                score += 20
-            }
-        }
-
-        if !trackAlbum.isEmpty, trackAlbum != "unknown album" {
-            if candidateAlbum == trackAlbum {
-                score += 40
-            } else if candidateAlbum.contains(trackAlbum) || trackAlbum.contains(candidateAlbum) {
-                score += 18
-            }
-        }
-
-        return score
-    }
-
-    private func bestMetadataFallback(for track: DownloadTrack) async -> DownloadMetadataFallbackMatch? {
-        let query = "\(track.artistLine) \(track.name)"
-        var matches: [(match: DownloadMetadataFallbackMatch, score: Int)] = []
-
-        let iTunesResults = await SongMetadata.searchiTunes(query: query)
-        for candidate in iTunesResults {
-            guard let title = candidate.trackName,
-                  let artist = candidate.artistName else { continue }
-
-            let source: DownloadSourceChoice?
-            if let url = candidate.trackViewUrl, !url.isEmpty {
-                source = DownloadSourceChoice(platform: .appleMusic, url: url, backendGenreSource: DownloadPlatform.appleMusic.backendGenreSource)
-            } else {
-                source = nil
-            }
-
-            let match = DownloadMetadataFallbackMatch(
-                title: title,
-                artist: artist,
-                album: candidate.collectionName,
-                source: source,
-                providerName: "iTunes"
-            )
-            matches.append((match, scoreMetadataFallback(title: title, artist: artist, album: candidate.collectionName, for: track)))
-        }
-
-        let deezerResults = await SongMetadata.searchDeezer(query: query)
-        for candidate in deezerResults {
-            let source: DownloadSourceChoice?
-            if let url = candidate.link, !url.isEmpty {
-                source = DownloadSourceChoice(platform: .deezer, url: url, backendGenreSource: DownloadPlatform.deezer.backendGenreSource)
-            } else {
-                source = nil
-            }
-
-            let match = DownloadMetadataFallbackMatch(
-                title: candidate.title,
-                artist: candidate.artist.name,
-                album: candidate.album.title,
-                source: source,
-                providerName: "Deezer"
-            )
-            matches.append((match, scoreMetadataFallback(title: candidate.title, artist: candidate.artist.name, album: candidate.album.title, for: track)))
-        }
-
-        let ranked = matches.sorted {
-            if $0.score == $1.score {
-                return $0.match.providerName < $1.match.providerName
-            }
-            return $0.score > $1.score
-        }
-
-        guard let best = ranked.first, best.score >= 115 else {
-            return nil
-        }
-
-        return best.match
-    }
-
-    private func scoreMetadataFallback(title: String, artist: String, album: String?, for track: DownloadTrack) -> Int {
-        let trackTitle = DownloadSupport.normalizedSearchValue(track.name)
-        let trackAlbum = DownloadSupport.normalizedSearchValue(track.albumName)
-        let candidateTitle = DownloadSupport.normalizedSearchValue(title)
-        let candidateAlbum = DownloadSupport.normalizedSearchValue(album ?? "")
-        let candidateArtists = DownloadSupport.artistTokens(from: artist)
-        let sourceArtists = DownloadSupport.artistTokens(from: track.artistLine)
-
-        var score = 0
-
-        if candidateTitle == trackTitle {
-            score += 140
-        } else if candidateTitle.contains(trackTitle) || trackTitle.contains(candidateTitle) {
-            score += 90
-        }
-
-        for artist in sourceArtists {
-            if candidateArtists.contains(artist) {
-                score += 35
-            } else if candidateArtists.contains(where: { $0.contains(artist) || artist.contains($0) }) {
-                score += 20
-            }
-        }
-
-        if !trackAlbum.isEmpty, trackAlbum != "unknown album" {
-            if candidateAlbum == trackAlbum {
-                score += 35
-            } else if candidateAlbum.contains(trackAlbum) || trackAlbum.contains(candidateAlbum) {
-                score += 15
-            }
-        }
-
-        return score
-    }
-
-    private func resolveDeezerSource(for track: DownloadTrack) async -> DownloadSourceChoice? {
-        let appleSong = await AppleMusicAPI.shared.fetchSong(id: track.id)
-        let metadataFallback = appleSong == nil ? await bestMetadataFallback(for: track) : nil
-        let searchQueries = buildTidalSearchQueries(for: track, appleSong: appleSong, metadataFallback: metadataFallback)
-        let exactISRC = appleSong?.attributes.isrc?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var deezerResults: [DeezerSong] = []
-        var seenIDs = Set<Int>()
-        for query in searchQueries {
-            let results = await SongMetadata.searchDeezer(query: query, limit: 10, index: 0)
-            for candidate in results where seenIDs.insert(candidate.id).inserted {
-                deezerResults.append(candidate)
-            }
-            if !deezerResults.isEmpty {
-                break
-            }
-        }
-
-        let ranked = deezerResults
-            .map { candidate in
-                (
-                    candidate,
-                    scoreDeezerCandidate(candidate, for: track, exactISRC: exactISRC)
-                )
-            }
-            .sorted {
-                if $0.1 == $1.1 {
-                    return ($0.0.rank ?? 0) > ($1.0.rank ?? 0)
-                }
-                return $0.1 > $1.1
-            }
-
-        guard let best = ranked.first, best.1 >= 120 else { return nil }
-        let url = best.0.link ?? "https://www.deezer.com/track/\(best.0.id)"
-        return DownloadSourceChoice(
-            platform: .deezer,
-            url: url,
-            backendGenreSource: DownloadPlatform.deezer.backendGenreSource
-        )
-    }
-
-    private func resolveExactDeezerSource(
-        for track: DownloadTrack,
-        source: DownloadSourceChoice
-    ) async -> DownloadSourceChoice? {
-        guard source.platform == .appleMusic || source.platform == .spotify else {
-            return nil
-        }
-
-        guard track.id.allSatisfy(\.isNumber) else {
-            return nil
-        }
-
-        guard let appleSong = await AppleMusicAPI.shared.fetchSong(id: track.id),
-              let isrc = appleSong.attributes.isrc?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !isrc.isEmpty,
-              let deezerSong = await SongMetadata.fetchDeezerTrackByISRC(isrc) else {
-            return nil
-        }
-
-        let score = scoreDeezerCandidate(deezerSong, for: track, exactISRC: isrc)
-        let sourcePrimaryArtist = DownloadSupport.normalizedSearchValue(primaryArtistName(from: track.artistLine))
-        let deezerPrimaryArtist = DownloadSupport.normalizedSearchValue(deezerSong.artist.name)
-        let sourceTitle = DownloadSupport.normalizedSearchValue(simplifiedTrackTitle(track.name))
-        let deezerTitle = DownloadSupport.normalizedSearchValue(simplifiedTrackTitle(deezerSong.title))
-
-        guard sourcePrimaryArtist == deezerPrimaryArtist else {
-            log("Rejected Deezer ISRC match for \(track.name): artist mismatch \(deezerSong.artist.name)")
-            return nil
-        }
-
-        guard sourceTitle == deezerTitle || deezerTitle.contains(sourceTitle) || sourceTitle.contains(deezerTitle) else {
-            log("Rejected Deezer ISRC match for \(track.name): title mismatch \(deezerSong.title)")
-            return nil
-        }
-
-        guard score >= 240 else { return nil }
-
-        let url = deezerSong.link ?? "https://www.deezer.com/track/\(deezerSong.id)"
-        return DownloadSourceChoice(
-            platform: .deezer,
-            url: url,
-            backendGenreSource: DownloadPlatform.deezer.backendGenreSource
-        )
-    }
-
-    private func scoreDeezerCandidate(_ candidate: DeezerSong, for track: DownloadTrack, exactISRC: String?) -> Int {
-        var score = scoreMetadataFallback(
-            title: candidate.title,
-            artist: candidate.artist.name,
-            album: candidate.album.title,
-            for: track
-        )
-
-        let candidateISRC = candidate.isrc?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let expectedISRC = exactISRC?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if let candidateISRC, let expectedISRC, !candidateISRC.isEmpty, candidateISRC == expectedISRC {
-            score += 120
-        }
-
-        let primaryArtist = DownloadSupport.normalizedSearchValue(primaryArtistName(from: track.artistLine))
-        let candidateArtist = DownloadSupport.normalizedSearchValue(candidate.artist.name)
-        if candidateArtist == primaryArtist {
-            score += 35
-        }
-
-        let simplifiedTrack = DownloadSupport.normalizedSearchValue(simplifiedTrackTitle(track.name))
-        let candidateTitle = DownloadSupport.normalizedSearchValue(candidate.title)
-        if candidateTitle == simplifiedTrack {
-            score += 20
-        }
-
-        return score
-    }
-
-    private func yoinkifyFormat(for serverPreference: DownloaderServerPreference) -> String {
+    private func desiredDownloadFormat() -> String {
         return UserDefaults.standard.string(forKey: "yoinkifyFormat") ?? "flac"
-    }
-
-    private func qobuzQuality(for serverPreference: DownloaderServerPreference) -> String {
-        if serverPreference == .auto {
-            switch DownloaderAutomaticQualityProfile(rawValue: UserDefaults.standard.string(forKey: "autoDownloadTier") ?? "") ?? .high {
-            case .low:
-                return QobuzQualityProfile.lossless.rawValue
-            case .medium:
-                return QobuzQualityProfile.hiRes.rawValue
-            case .high:
-                return QobuzQualityProfile.hiResMax.rawValue
-            }
-        }
-
-        return UserDefaults.standard.string(forKey: "qobuzFallbackQuality") ?? QobuzQualityProfile.hiResMax.rawValue
-    }
-
-    private func yoinkProofOfWork(difficulty: Int = 16) async -> [String: Any]? {
-        let challengeData = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-        let challenge = challengeData.map { String(format: "%02x", $0) }.joined()
-        let timestamp = Int(Date().timeIntervalSince1970 * 1000)
-
-        var nonce = 0
-        while nonce < Int.max {
-            let input = Data("\(challenge):\(nonce)".utf8)
-            let digest = SHA256.hash(data: input)
-            if hasLeadingZeroBits(digest, count: difficulty) {
-                let hash = digest.map { String(format: "%02x", $0) }.joined()
-                log("Yoinkify proof-of-work solved at nonce \(nonce)")
-                return [
-                    "challenge": challenge,
-                    "nonce": nonce,
-                    "hash": hash,
-                    "timestamp": timestamp
-                ]
-            }
-
-            nonce += 1
-            if nonce.isMultiple(of: 1_000) {
-                await Task.yield()
-            }
-        }
-
-        log("Yoinkify proof-of-work could not be solved.")
-        return nil
-    }
-
-    private func hasLeadingZeroBits(_ digest: SHA256.Digest, count: Int) -> Bool {
-        let bytes = Array(digest)
-        let fullBytes = count / 8
-        let remainingBits = count % 8
-
-        for index in 0..<fullBytes {
-            guard bytes[index] == 0 else { return false }
-        }
-
-        guard remainingBits > 0 else { return true }
-        let mask = UInt8(0xFF << (8 - remainingBits))
-        return (bytes[fullBytes] & mask) == 0
-    }
-
-    private func makeQobuzDownloadPayload(trackID: String, quality: String) throws -> Data {
-        let payload: [String: Any] = [
-            "quality": quality,
-            "upload_to_r2": false,
-            "url": "https://open.qobuz.com/track/\(trackID)"
-        ]
-        return try JSONSerialization.data(withJSONObject: payload)
-    }
-
-    private func tidalCandidates(trackID: String) async -> [BackendCandidate] {
-        let quality = tidalTrackQuality()
-        let backends = await rotatedTidalTrackBackends()
-        return backends.compactMap { backend in
-            makeRequest(
-                label: backend.label,
-                urlString: "\(backend.baseURL)/track/?id=\(trackID)&quality=\(quality)",
-                tidalAPIBaseURL: backend.baseURL
-            )
-        }
-    }
-
-    private func tidalCandidates(trackID: String, preference: DownloaderServerPreference) async -> [BackendCandidate] {
-        let quality = tidalTrackQuality()
-        switch preference {
-        case .hifiOne:
-            return await preferredTidalCandidates(
-                trackID: trackID,
-                quality: quality,
-                preferredBaseURL: "https://hifi-one.spotisaver.net",
-                preferredLabel: "HiFi One"
-            )
-        case .hifiTwo:
-            return await preferredTidalCandidates(
-                trackID: trackID,
-                quality: quality,
-                preferredBaseURL: "https://hifi-two.spotisaver.net",
-                preferredLabel: "HiFi Two"
-            )
-        case .byeTunesAPI, .qobuz, .appleMusicAPI, .deezerAPI, .pandoraAPI, .amazonAPI, .soundCloudAPI, .youtubeAPI:
-            return []
-        case .auto, .yoinkify, .tidalAPI:
-            return await tidalCandidates(trackID: trackID)
-        }
-    }
-
-    private func tidalTrackQuality() -> String {
-        let serverPreference = DownloaderServerPreference(rawValue: UserDefaults.standard.string(forKey: "downloadServer") ?? "") ?? .auto
-        if serverPreference == .auto {
-            switch DownloaderAutomaticQualityProfile(rawValue: UserDefaults.standard.string(forKey: "autoDownloadTier") ?? "") ?? .high {
-            case .low:
-                return "LOW"
-            case .medium:
-                return "HIGH"
-            case .high:
-                return "LOSSLESS"
-            }
-        }
-        return UserDefaults.standard.string(forKey: "tidalFallbackQuality") ?? "LOSSLESS"
     }
 
     private func rotatedTidalTrackBackends() async -> [(label: String, baseURL: String)] {
@@ -5648,30 +4797,6 @@ final class DownloadViewModel: ObservableObject {
         UserDefaults.standard.set(baseURL, forKey: TidalAPIRegistry.lastUsedKey)
     }
 
-    private func preferredTidalCandidates(
-        trackID: String,
-        quality: String,
-        preferredBaseURL: String,
-        preferredLabel: String
-    ) async -> [BackendCandidate] {
-        let rotated = await rotatedTidalTrackBackends().map(\.baseURL)
-        let orderedBaseURLs = normalizeTidalAPIBaseURLs([preferredBaseURL] + rotated)
-        return orderedBaseURLs.compactMap { baseURL in
-            let label: String
-            if baseURL == preferredBaseURL {
-                label = preferredLabel
-            } else {
-                label = "Tidal API (\(URL(string: baseURL)?.host ?? baseURL))"
-            }
-
-            return makeRequest(
-                label: label,
-                urlString: "\(baseURL)/track/?id=\(trackID)&quality=\(quality)",
-                tidalAPIBaseURL: baseURL
-            )
-        }
-    }
-
     private func executeCandidatesUntilSuccess(
         _ candidates: [BackendCandidate],
         trackID: String,
@@ -5685,17 +4810,35 @@ final class DownloadViewModel: ObservableObject {
         var lastError: Error = DownloadError.mappingFailed("All backend requests failed.")
 
         for candidate in candidates {
+            // A cancellation here (e.g. `appDidEnterBackground()` cancelling this track's
+            // foreground worker to hand it off to the background session) surfaces as a thrown
+            // error from the candidate's request, indistinguishable at this point from a genuine
+            // backend failure. Without this check, the catch block below just logged it as "this
+            // candidate failed" and moved on to try the next one (typically the MP3 fallback) —
+            // under the same already-cancelled Task, which could still complete a fast MP3
+            // request before anything else noticed the cancellation. That silently turned an
+            // intended abort-and-hand-off into a quiet downgrade to MP3, and it happened
+            // deterministically to the tracks that were actually mid-download at the moment of
+            // backgrounding — i.e. exactly the first `maxConcurrentDownloads` tracks of a batch.
+            guard !Task.isCancelled else {
+                throw CancellationError()
+            }
             do {
+                let candidateFallbackExtension = DownloadSupport.fallbackExtension(
+                    forRequestedFormat: candidate.requestedFormat,
+                    defaultingTo: fallbackExtension
+                )
                 let fileURL: URL
                 if let customDownload = candidate.customDownload {
-                    fileURL = try await customDownload(trackID, suggestedName, fallbackExtension)
+                    fileURL = try await customDownload(trackID, suggestedName, candidateFallbackExtension)
                 } else if let request = candidate.request {
                     fileURL = try await executeDownloadRequest(
                         request,
                         trackID: trackID,
                         backendLabel: candidate.label,
                         suggestedName: suggestedName,
-                        fallbackExtension: fallbackExtension
+                        fallbackExtension: candidateFallbackExtension,
+                        requestedFormat: candidate.requestedFormat
                     )
                 } else {
                     throw DownloadError.mappingFailed("No usable backend request was created for \(candidate.label).")
@@ -5707,6 +4850,9 @@ final class DownloadViewModel: ObservableObject {
                 BackendHealthStore.shared.recordSuccess(label: candidate.label)
                 return BackendDownloadOutcome(fileURL: fileURL, backendLabel: candidate.label)
             } catch {
+                if Task.isCancelled {
+                    throw error
+                }
                 lastError = error
                 log("\(candidate.label) backend failed: \(error.localizedDescription)")
                 BackendHealthStore.shared.recordFailure(label: candidate.label, error: error.localizedDescription)
@@ -5722,6 +4868,7 @@ final class DownloadViewModel: ObservableObject {
         backendLabel: String,
         suggestedName: String,
         fallbackExtension: String,
+        requestedFormat: String? = nil,
         depth: Int = 0
     ) async throws -> URL {
         if depth > 4 {
@@ -5732,7 +4879,7 @@ final class DownloadViewModel: ObservableObject {
         applyZarzHeaders(to: &request)
         log("Requesting \(redactedDownloadURLString(request.url))")
 
-        let shouldUseBackgroundTransfer = backgroundDownloadsEnabled
+        let shouldUseBackgroundTransfer = backgroundDownloadsEnabled && !isAppActive
         log("executeDownloadRequest track=\(trackID) backend=\(backendLabel) depth=\(depth) method=\(request.httpMethod ?? "GET") background=\(shouldUseBackgroundTransfer)")
         let data: Data
         let response: URLResponse
@@ -5744,13 +4891,10 @@ final class DownloadViewModel: ObservableObject {
                     trackID: trackID,
                     backendLabel: backendLabel,
                     suggestedName: suggestedName,
-                    fallbackExtension: fallbackExtension,
-                    trackName: knownTracksByID[trackID]?.name,
-                    artistName: knownTracksByID[trackID]?.artistLine,
-                    queueText: queueCounterText
+                    fallbackExtension: fallbackExtension
                 ),
                 progress: { [weak self] progress, speedBps in
-                    self?.updateVisibleDownloadProgress(progress, speedBps: speedBps)
+                    self?.updateVisibleDownloadProgress(progress, speedBps: speedBps, trackID: trackID)
                 }
             )
             backgroundFileURL = backgroundResult.fileURL
@@ -5760,7 +4904,7 @@ final class DownloadViewModel: ObservableObject {
             response = backgroundResult.response
         } else {
             let fetched = try await fetchDataWithProgress(for: request) { [weak self] progress, speedBps in
-                self?.updateVisibleDownloadProgress(progress, speedBps: speedBps)
+                self?.updateVisibleDownloadProgress(progress, speedBps: speedBps, trackID: trackID)
             }
             backgroundFileURL = nil
             data = fetched.0
@@ -5777,6 +4921,7 @@ final class DownloadViewModel: ObservableObject {
                 backendLabel: backendLabel,
                 suggestedName: suggestedName,
                 fallbackExtension: fallbackExtension,
+                requestedFormat: requestedFormat,
                 depth: depth + 1
             )
         }
@@ -5790,6 +4935,7 @@ final class DownloadViewModel: ObservableObject {
                 backendLabel: backendLabel,
                 suggestedName: suggestedName,
                 fallbackExtension: fallbackExtension,
+                requestedFormat: requestedFormat,
                 depth: depth + 1
             )
         }
@@ -5806,6 +4952,8 @@ final class DownloadViewModel: ObservableObject {
             throw DownloadError.remoteFailure(bodyText)
         }
 
+        recordQualityNoteIfNeeded(trackID: trackID, requestedFormat: requestedFormat, httpResponse: httpResponse)
+
         if let backgroundFileURL {
             return backgroundFileURL
         }
@@ -5814,10 +4962,38 @@ final class DownloadViewModel: ObservableObject {
         return try saveDownloadedData(data, suggestedName: suggestedName, fileExtension: fileExtension)
     }
 
+    /// Compares what format was actually delivered (via the backend's `X-Audio-*` response
+    /// headers) against what was requested, and records a user-facing note when they differ —
+    /// e.g. FLAC was requested but the track wasn't available lossless on Deezer/Tidal, so the
+    /// backend silently served MP3 with a 200 instead of erroring. Clears any stale note when
+    /// a retry succeeds at the originally requested format.
+    private func recordQualityNoteIfNeeded(trackID: String, requestedFormat: String?, httpResponse: HTTPURLResponse?) {
+        guard let requestedFormat else { return }
+        guard let deliveredFormat = httpResponse?.value(forHTTPHeaderField: "X-Audio-Format") else { return }
+
+        guard deliveredFormat.caseInsensitiveCompare(requestedFormat) != .orderedSame else {
+            trackQualityNotes.removeValue(forKey: trackID)
+            return
+        }
+
+        let source = httpResponse?.value(forHTTPHeaderField: "X-Audio-Source")
+        let quality = httpResponse?.value(forHTTPHeaderField: "X-Audio-Quality")
+        var note = "Requested \(requestedFormat.uppercased()), got \(deliveredFormat.uppercased())"
+        if let quality, deliveredFormat.caseInsensitiveCompare("mp3") == .orderedSame {
+            note += " \(quality)kbps"
+        }
+        note += ". Lossless wasn't available for this track"
+        if let source {
+            note += " (source: \(source.capitalized))"
+        }
+        trackQualityNotes[trackID] = note
+        log("Quality note for \(trackID): \(note)")
+    }
+
     private func redactedDownloadURLString(_ url: URL?) -> String {
         guard let url else { return "<unknown>" }
         if url.host?.caseInsensitiveCompare(Config.byeTunesApiHost) == .orderedSame {
-            return "ByeTunes API"
+            return Config.downloadBackendLabel
         }
         return url.absoluteString
     }
@@ -6109,167 +5285,6 @@ final class DownloadViewModel: ObservableObject {
         return mapped
     }
 
-    private func buildTidalSearchQueries(
-        for track: DownloadTrack,
-        appleSong: AppleMusicAPI.AppleMusicSong?,
-        metadataFallback: DownloadMetadataFallbackMatch? = nil
-    ) -> [String] {
-        var orderedQueries: [String] = []
-        var seenQueries = Set<String>()
-
-        func appendQuery(_ rawValue: String?) {
-            let trimmed = (rawValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            let normalized = DownloadSupport.normalizedSearchValue(trimmed)
-            guard !normalized.isEmpty, seenQueries.insert(normalized).inserted else { return }
-            orderedQueries.append(trimmed)
-        }
-
-        let title = appleSong?.attributes.name ?? metadataFallback?.title ?? track.name
-        let artist = appleSong?.attributes.artistName ?? metadataFallback?.artist ?? track.artistLine
-        let album = appleSong?.attributes.albumName ?? metadataFallback?.album ?? track.albumName
-        let strippedArtist = primaryArtistName(from: artist)
-        let simplifiedTitle = simplifiedTrackTitle(title)
-
-        appendQuery(appleSong?.attributes.isrc)
-        appendQuery("\(title) \(artist)")
-        appendQuery("\(title) \(strippedArtist)")
-        appendQuery("\(simplifiedTitle) \(artist)")
-        appendQuery("\(simplifiedTitle) \(strippedArtist)")
-
-        if !album.isEmpty, DownloadSupport.normalizedSearchValue(album) != "unknown album" {
-            appendQuery("\(title) \(artist) \(album)")
-            appendQuery("\(title) \(strippedArtist) \(album)")
-            appendQuery("\(artist) \(album) \(title)")
-            appendQuery("\(simplifiedTitle) \(artist) \(album)")
-        }
-
-        appendQuery("\(artist) \(title)")
-        appendQuery("\(strippedArtist) \(simplifiedTitle)")
-        appendQuery(title)
-        appendQuery(simplifiedTitle)
-
-        return orderedQueries
-    }
-
-    private func primaryArtistName(from artistLine: String) -> String {
-        let separatorsPattern = #"\s*(?:,|&| x | y | feat\.?|ft\.?|with)\s*"#
-        let canonicalized = artistLine.replacingOccurrences(of: separatorsPattern, with: ",", options: .regularExpression)
-        let primary = canonicalized
-            .components(separatedBy: ",")
-            .first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (primary?.isEmpty == false) ? primary! : artistLine
-    }
-
-    private func simplifiedTrackTitle(_ title: String) -> String {
-        let withoutBracketed = title.replacingOccurrences(
-            of: #"\s*[\(\[].*?[\)\]]"#,
-            with: "",
-            options: .regularExpression
-        )
-        let trimmed = withoutBracketed.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? title : trimmed
-    }
-
-    private func searchTidalCandidateTrackIDs(
-        for track: DownloadTrack,
-        query: String,
-        excluding excludedTrackIDs: Set<String>
-    ) async -> [String] {
-        let searchHosts = await rotatedTidalSearchHosts()
-
-        var mergedCandidates: [TidalSearchItem] = []
-        var seenCandidateIDs = Set<Int>()
-        var sawResolvableFailure = false
-
-        for host in searchHosts {
-            do {
-                let response = try await fetchTidalSearchResponse(query: query, host: host)
-                let freshCandidates = response.data.items.filter { seenCandidateIDs.insert($0.id).inserted }
-                mergedCandidates.append(contentsOf: freshCandidates)
-                if !freshCandidates.isEmpty {
-                    log("Tidal search host \(host) returned \(freshCandidates.count) candidate(s) for '\(query)'")
-                }
-            } catch {
-                sawResolvableFailure = sawResolvableFailure || isTransientSearchFailure(error)
-                log("Tidal search host \(host) failed for '\(query)': \(error.localizedDescription)")
-            }
-        }
-
-        let rankedCandidates = mergedCandidates
-            .filter { !excludedTrackIDs.contains(String($0.id)) }
-            .map { candidate in
-                (candidate, scoreTidalCandidate(candidate, for: track))
-            }
-            .filter { $0.1 > 0 }
-            .sorted {
-                if $0.1 == $1.1 {
-                    return $0.0.id < $1.0.id
-                }
-                return $0.1 > $1.1
-            }
-
-        let bestIDs = rankedCandidates.prefix(5).map { String($0.0.id) }
-        if !bestIDs.isEmpty {
-            log("Tidal search '\(query)' candidates: \(bestIDs.joined(separator: ", "))")
-        } else if sawResolvableFailure {
-            log("Tidal search '\(query)' had only transient host failures across all search backends.")
-        }
-        return bestIDs
-    }
-
-    private func searchQobuzCandidateTrackIDs(
-        for track: DownloadTrack,
-        query: String,
-        excluding excludedTrackIDs: Set<String>
-    ) async -> QobuzSearchOutcome {
-        let searchBaseURLs = QobuzAPIRegistry.searchBaseURLs
-
-        var mergedCandidates: [QobuzSearchTrackItem] = []
-        var seenCandidateIDs = Set<String>()
-        var sawResolvableFailure = false
-
-        for baseURL in searchBaseURLs {
-            do {
-                let response = try await fetchQobuzSearchResponse(query: query, baseURL: baseURL)
-                let freshCandidates = response.tracks.items.filter {
-                    let id = String($0.id)
-                    return seenCandidateIDs.insert(id).inserted
-                }
-                mergedCandidates.append(contentsOf: freshCandidates)
-                if !freshCandidates.isEmpty {
-                    log("Qobuz search host \(baseURL) returned \(freshCandidates.count) candidate(s) for '\(query)'")
-                }
-            } catch {
-                sawResolvableFailure = sawResolvableFailure || isTransientSearchFailure(error)
-                log("Qobuz search host \(baseURL) failed for '\(query)': \(error.localizedDescription)")
-            }
-        }
-
-        let rankedCandidates = mergedCandidates
-            .filter { !excludedTrackIDs.contains(String($0.id)) }
-            .map { candidate in
-                (candidate, scoreQobuzCandidate(candidate, for: track))
-            }
-            .filter { $0.1 > 0 }
-            .sorted {
-                if $0.1 == $1.1 {
-                    return $0.0.id < $1.0.id
-                }
-                return $0.1 > $1.1
-            }
-
-        let bestScore = rankedCandidates.first?.1 ?? 0
-        let bestIDs = rankedCandidates.prefix(5).map { String($0.0.id) }
-        if !bestIDs.isEmpty {
-            log("Qobuz search '\(query)' candidates: \(bestIDs.joined(separator: ", "))")
-        } else if sawResolvableFailure {
-            log("Qobuz search '\(query)' had only transient host failures across all search backends.")
-        }
-        return QobuzSearchOutcome(trackIDs: bestIDs, bestScore: bestScore)
-    }
-
     private func fetchPreferredTidalSearchResponse(
         query: String,
         limit: Int = 25,
@@ -6330,20 +5345,6 @@ final class DownloadViewModel: ObservableObject {
         throw lastError ?? DownloadError.searchFailed
     }
 
-    private func fetchQobuzSearchResponse(query: String, baseURL: String) async throws -> QobuzSearchResponse {
-        guard var components = URLComponents(string: "\(baseURL)/track/search") else {
-            throw DownloadError.invalidURL(baseURL)
-        }
-        components.queryItems = [URLQueryItem(name: "query", value: query)]
-        guard let url = components.url else {
-            throw DownloadError.invalidURL(baseURL)
-        }
-
-        let (data, response) = try await session.data(for: URLRequest(url: url))
-        try validateHTTP(response: response, data: data)
-        return try JSONDecoder().decode(QobuzSearchResponse.self, from: data)
-    }
-
     private func isTransientSearchFailure(_ error: Error) -> Bool {
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
@@ -6352,108 +5353,6 @@ final class DownloadViewModel: ObservableObject {
         default:
             return false
         }
-    }
-
-    private func scoreTidalCandidate(_ candidate: TidalSearchItem, for track: DownloadTrack) -> Int {
-        let normalizedTrackTitle = DownloadSupport.normalizedSearchValue(track.name)
-        let normalizedAlbumName = DownloadSupport.normalizedSearchValue(track.albumName)
-        let candidateTitle = DownloadSupport.normalizedSearchValue(candidate.title)
-        let candidateCombinedTitle = DownloadSupport.normalizedSearchValue(
-            [candidate.title, candidate.version].compactMap { $0 }.joined(separator: " ")
-        )
-
-        var score = 0
-
-        if !normalizedTrackTitle.isEmpty {
-            if candidateCombinedTitle == normalizedTrackTitle {
-                score += 180
-            } else if candidateTitle == normalizedTrackTitle {
-                score += 150
-            } else if candidateCombinedTitle.contains(normalizedTrackTitle) || normalizedTrackTitle.contains(candidateCombinedTitle) {
-                score += 110
-            } else if candidateTitle.contains(normalizedTrackTitle) || normalizedTrackTitle.contains(candidateTitle) {
-                score += 80
-            }
-        }
-
-        let sourceArtistTokens = DownloadSupport.artistTokens(from: track.artistLine)
-        let candidateArtists = (candidate.artists?.map(\.name) ?? [candidate.artist?.name].compactMap { $0 })
-            .map(DownloadSupport.normalizedSearchValue)
-        for token in sourceArtistTokens {
-            if candidateArtists.contains(token) {
-                score += 45
-            } else if candidateArtists.contains(where: { $0.contains(token) || token.contains($0) }) {
-                score += 25
-            }
-        }
-
-        let candidateAlbumName = DownloadSupport.normalizedSearchValue(candidate.album?.title ?? "")
-        if !normalizedAlbumName.isEmpty, normalizedAlbumName != "unknown album" {
-            if candidateAlbumName == normalizedAlbumName {
-                score += 35
-            } else if candidateAlbumName.contains(normalizedAlbumName) || normalizedAlbumName.contains(candidateAlbumName) {
-                score += 20
-            }
-        }
-
-        if DownloadSupport.normalizedSearchValue(track.name).contains("remix"),
-           DownloadSupport.normalizedSearchValue(candidate.version ?? "").contains("remix") {
-            score += 20
-        }
-
-        if candidate.audioQuality?.uppercased().contains("LOSSLESS") == true {
-            score += 5
-        }
-
-        return score
-    }
-
-    private func scoreQobuzCandidate(_ candidate: QobuzSearchTrackItem, for track: DownloadTrack) -> Int {
-        let normalizedTrackTitle = DownloadSupport.normalizedSearchValue(track.name)
-        let normalizedAlbumName = DownloadSupport.normalizedSearchValue(track.albumName)
-        let candidateTitle = DownloadSupport.normalizedSearchValue(candidate.title)
-        let candidateCombinedTitle = DownloadSupport.normalizedSearchValue(
-            [candidate.title, candidate.version].compactMap { $0 }.joined(separator: " ")
-        )
-
-        var score = 0
-
-        if !normalizedTrackTitle.isEmpty {
-            if candidateCombinedTitle == normalizedTrackTitle {
-                score += 180
-            } else if candidateTitle == normalizedTrackTitle {
-                score += 150
-            } else if candidateCombinedTitle.contains(normalizedTrackTitle) || normalizedTrackTitle.contains(candidateCombinedTitle) {
-                score += 110
-            } else if candidateTitle.contains(normalizedTrackTitle) || normalizedTrackTitle.contains(candidateTitle) {
-                score += 80
-            }
-        }
-
-        let sourceArtistTokens = DownloadSupport.artistTokens(from: track.artistLine)
-        let candidateArtists = DownloadSupport.artistTokens(from: candidate.performer?.name ?? candidate.album.artist.name)
-        for token in sourceArtistTokens {
-            if candidateArtists.contains(token) {
-                score += 45
-            } else if candidateArtists.contains(where: { $0.contains(token) || token.contains($0) }) {
-                score += 25
-            }
-        }
-
-        let candidateAlbumName = DownloadSupport.normalizedSearchValue(candidate.album.title)
-        if !normalizedAlbumName.isEmpty, normalizedAlbumName != "unknown album" {
-            if candidateAlbumName == normalizedAlbumName {
-                score += 35
-            } else if candidateAlbumName.contains(normalizedAlbumName) || normalizedAlbumName.contains(candidateAlbumName) {
-                score += 20
-            }
-        }
-
-        if candidate.downloadable == true {
-            score += 8
-        }
-
-        return score
     }
 
     private func scoreDisplayTidalCandidate(_ candidate: TidalSearchItem, query: String) -> Int {
@@ -6534,24 +5433,6 @@ final class DownloadViewModel: ObservableObject {
                 onProgress(progress, speedBps)
             }
         }
-    }
-
-    private func makeRequest(label: String, urlString: String, tidalAPIBaseURL: String? = nil) -> BackendCandidate? {
-        guard let url = URL(string: urlString) else { return nil }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        applyZarzHeaders(to: &request)
-        return BackendCandidate(label: label, request: request, tidalAPIBaseURL: tidalAPIBaseURL, customDownload: nil)
-    }
-
-    private func makePOSTRequest(label: String, urlString: String, jsonBody: Data, tidalAPIBaseURL: String? = nil) -> BackendCandidate? {
-        guard let url = URL(string: urlString) else { return nil }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applyZarzHeaders(to: &request)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonBody
-        return BackendCandidate(label: label, request: request, tidalAPIBaseURL: tidalAPIBaseURL, customDownload: nil)
     }
 
     private func applyZarzHeaders(to request: inout URLRequest) {
@@ -6678,9 +5559,7 @@ final class DownloadViewModel: ObservableObject {
         )
     }
 
-    private func metadataTrack(from song: DeezerSong) -> DownloadTrack {
-        let normalizedArtist = DownloadSupport.normalizedSearchValue(song.artist.name)
-        let normalizedAlbum = DownloadSupport.normalizedSearchValue(song.album.title)
+    private func metadataTrack(from song: DeezerSong, sourceURLOverride: String? = nil) -> DownloadTrack {
         return DownloadTrack(
             id: "deezer-\(song.id)",
             name: song.title,
@@ -6688,11 +5567,11 @@ final class DownloadViewModel: ObservableObject {
             albumName: song.album.title,
             artworkURL: URL(string: song.album.cover_xl),
             isExplicit: song.explicit_lyrics ?? false,
-            sourceURL: song.link ?? "https://www.deezer.com/track/\(song.id)",
+            sourceURL: sourceURLOverride ?? song.link ?? "https://www.deezer.com/track/\(song.id)",
             sourceContext: .song,
             provider: .metadata,
-            artistIdentifier: "deezer-artist-\(normalizedArtist)",
-            albumIdentifier: "deezer-album-\(normalizedArtist)-\(normalizedAlbum)",
+            artistIdentifier: "deezer-artist-\(song.artist.id)",
+            albumIdentifier: "deezer-album-\(song.album.id)",
             previewURL: song.preview.flatMap(URL.init(string:))
         )
     }
@@ -6713,11 +5592,11 @@ final class DownloadViewModel: ObservableObject {
         metadataAlbumTrackCache = grouped
 
         return orderedKeys.compactMap { key in
-            guard let firstTrack = grouped[key]?.first else { return nil }
+            guard let groupTracks = grouped[key], let firstTrack = groupTracks.first else { return nil }
             return DownloadAlbum(
                 id: key,
                 name: firstTrack.albumName,
-                artistLine: firstTrack.artistLine,
+                artistLine: mostCommonArtistLine(in: groupTracks),
                 artworkURL: firstTrack.artworkURL,
                 sourceURL: firstTrack.sourceURL,
                 provider: .metadata,
@@ -6725,6 +5604,15 @@ final class DownloadViewModel: ObservableObject {
                 albumIdentifier: key
             )
         }
+    }
+
+    private func mostCommonArtistLine(in tracks: [DownloadTrack]) -> String {
+        var counts: [String: Int] = [:]
+        for track in tracks {
+            counts[track.artistLine, default: 0] += 1
+        }
+        let mostCommon = counts.max { lhs, rhs in lhs.value < rhs.value }?.key
+        return (mostCommon?.isEmpty == false) ? mostCommon! : (tracks.first?.artistLine ?? "")
     }
 
     private func fetchAlbumTracks(albumID: String, fallbackAlbumName: String, sourceURL: String? = nil) async -> [DownloadTrack] {
@@ -6954,7 +5842,69 @@ final class DownloadViewModel: ObservableObject {
         return nil
     }
 
+    private func fetchSpotifyMetadata(url: String) async -> [String: Any]? {
+        guard let endpoint = URL(string: "\(Config.byeTunesApiUrl)/api/metadata") else { return nil }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["url": url])
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return json
+        } catch {
+            log("Spotify metadata fetch failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func spotifyTrackID(fromSpotifyURL spotifyURL: String) -> String? {
+        firstRegexCapture(in: spotifyURL, pattern: #"track/([a-zA-Z0-9]+)"#, group: 1)
+    }
+
+    private func downloadTrack(fromMetadataItem item: [String: Any], fallbackArtistLine: String, fallbackAlbumName: String, fallbackArtworkURL: URL?, sourceContext: DownloadTrack.SourceContext, albumIdentifier: String?) -> DownloadTrack? {
+        guard let trackURLString = item["spotifyUrl"] as? String,
+              let trackID = spotifyTrackID(fromSpotifyURL: trackURLString) else { return nil }
+        let trackArtworkURL = (item["albumArt"] as? String).flatMap(URL.init(string:)) ?? fallbackArtworkURL
+        return DownloadTrack(
+            id: trackID,
+            name: item["name"] as? String ?? "Unknown Title",
+            artistLine: (item["artist"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackArtistLine,
+            albumName: item["album"] as? String ?? fallbackAlbumName,
+            artworkURL: trackArtworkURL,
+            isExplicit: item["explicit"] as? Bool ?? false,
+            sourceURL: "https://open.spotify.com/track/\(trackID)",
+            sourceContext: sourceContext,
+            provider: .metadata,
+            artistIdentifier: nil,
+            albumIdentifier: albumIdentifier,
+            previewURL: nil
+        )
+    }
+
     private func fetchSpotifyTrack(id: String, sourceURL: String) async -> DownloadTrack? {
+        if let json = await fetchSpotifyMetadata(url: sourceURL), json["type"] as? String == "track" {
+            let artistLine = json["artist"] as? String ?? "Unknown Artist"
+            let albumName = json["album"] as? String ?? "Unknown Album"
+            let artworkURL = (json["albumArt"] as? String).flatMap(URL.init(string:))
+            return DownloadTrack(
+                id: id,
+                name: json["name"] as? String ?? "Unknown Title",
+                artistLine: artistLine,
+                albumName: albumName,
+                artworkURL: artworkURL,
+                isExplicit: json["explicit"] as? Bool ?? false,
+                sourceURL: sourceURL,
+                sourceContext: .song,
+                provider: .metadata,
+                artistIdentifier: nil,
+                albumIdentifier: nil,
+                previewURL: nil
+            )
+        }
         if let token = await fetchSpotifyToken() {
             guard let url = URL(string: "https://api.spotify.com/v1/tracks/\(id)") else { return nil }
             var request = URLRequest(url: url)
@@ -7116,6 +6066,31 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func fetchSpotifyAlbum(id: String, sourceURL: String) async -> (DownloadAlbum, [DownloadTrack])? {
+        if let json = await fetchSpotifyMetadata(url: sourceURL) {
+            let albumName = json["name"] as? String ?? "Unknown Album"
+            let artworkURL = (json["image"] as? String).flatMap(URL.init(string:))
+            let rawTracks = json["tracks"] as? [[String: Any]] ?? []
+            let artistLine = rawTracks.first.flatMap { $0["albumArtist"] as? String ?? $0["artist"] as? String } ?? "Unknown Artist"
+
+            let albumResult = DownloadAlbum(
+                id: id,
+                name: albumName,
+                artistLine: artistLine,
+                artworkURL: artworkURL,
+                sourceURL: sourceURL,
+                provider: .metadata,
+                artistIdentifier: nil,
+                albumIdentifier: id
+            )
+
+            let tracks = rawTracks.compactMap {
+                downloadTrack(fromMetadataItem: $0, fallbackArtistLine: artistLine, fallbackAlbumName: albumName, fallbackArtworkURL: artworkURL, sourceContext: .album, albumIdentifier: id)
+            }
+
+            if !tracks.isEmpty {
+                return (albumResult, tracks)
+            }
+        }
         if let token = await fetchSpotifyToken() {
             guard let url = URL(string: "https://api.spotify.com/v1/albums/\(id)") else { return nil }
             var albumRequest = URLRequest(url: url)
@@ -7143,7 +6118,7 @@ final class DownloadViewModel: ObservableObject {
                     )
                     
                     var tracks: [DownloadTrack] = []
-                    
+
                     if let tracksContainer = json["tracks"] as? [String: Any],
                        let items = tracksContainer["items"] as? [[String: Any]] {
                         for item in items {
@@ -7153,7 +6128,7 @@ final class DownloadViewModel: ObservableObject {
                                 let trackArtistLine = trackArtists.compactMap { $0["name"] as? String }.joined(separator: ", ")
                                 let explicit = item["explicit"] as? Bool ?? false
                                 let trackURL = "https://open.spotify.com/track/\(trackID)"
-                                
+
                                 tracks.append(DownloadTrack(
                                     id: trackID,
                                     name: trackName,
@@ -7171,7 +6146,7 @@ final class DownloadViewModel: ObservableObject {
                             }
                         }
                     }
-                    
+
                     return (albumResult, tracks)
                 }
             } catch {
@@ -7424,6 +6399,31 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func fetchSpotifyPlaylist(id: String, sourceURL: String) async -> (DownloadAlbum, [DownloadTrack])? {
+        if let json = await fetchSpotifyMetadata(url: sourceURL) {
+            let playlistName = json["name"] as? String ?? "Unknown Playlist"
+            let artworkURL = (json["image"] as? String).flatMap(URL.init(string:))
+            let rawTracks = json["tracks"] as? [[String: Any]] ?? []
+            let description = "Playlist • \(rawTracks.count) items"
+
+            let playlistResult = DownloadAlbum(
+                id: id,
+                name: playlistName,
+                artistLine: description,
+                artworkURL: artworkURL,
+                sourceURL: sourceURL,
+                provider: .metadata,
+                artistIdentifier: nil,
+                albumIdentifier: id
+            )
+
+            let tracks = rawTracks.compactMap {
+                downloadTrack(fromMetadataItem: $0, fallbackArtistLine: "Unknown Artist", fallbackAlbumName: playlistName, fallbackArtworkURL: artworkURL, sourceContext: .song, albumIdentifier: nil)
+            }
+
+            if !tracks.isEmpty {
+                return (playlistResult, tracks)
+            }
+        }
         if let token = await fetchSpotifyToken() {
             guard let url = URL(string: "https://api.spotify.com/v1/playlists/\(id)") else { return nil }
             var playlistRequest = URLRequest(url: url)
@@ -7450,7 +6450,7 @@ final class DownloadViewModel: ObservableObject {
                     )
                     
                     var tracks: [DownloadTrack] = []
-                    
+
                     if let tracksContainer = json["tracks"] as? [String: Any],
                        let items = tracksContainer["items"] as? [[String: Any]] {
                         for item in items {
@@ -7465,7 +6465,7 @@ final class DownloadViewModel: ObservableObject {
                                 let trackAlbumName = trackAlbum?["name"] as? String ?? "Unknown Album"
                                 let trackArtworkURLString = (trackAlbum?["images"] as? [[String: Any]])?.first?["url"] as? String
                                 let trackArtworkURL = trackArtworkURLString.flatMap(URL.init(string:))
-                                
+
                                 tracks.append(DownloadTrack(
                                     id: trackID,
                                     name: trackName,
@@ -7483,7 +6483,7 @@ final class DownloadViewModel: ObservableObject {
                             }
                         }
                     }
-                    
+
                     return (playlistResult, tracks)
                 }
             } catch {
@@ -7494,6 +6494,16 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func fetchSpotifyArtist(id: String, sourceURL: String) async -> DownloadArtist? {
+        if let json = await fetchSpotifyMetadata(url: sourceURL),
+           let name = json["name"] as? String {
+            let artworkURL = (json["image"] as? String).flatMap(URL.init(string:))
+            return DownloadArtist(
+                id: id,
+                name: name,
+                provider: .metadata,
+                artworkURL: artworkURL
+            )
+        }
         if let token = await fetchSpotifyToken() {
             guard let url = URL(string: "https://api.spotify.com/v1/artists/\(id)") else { return nil }
             var artistRequest = URLRequest(url: url)
@@ -7849,46 +6859,84 @@ final class DownloadViewModel: ObservableObject {
         Logger.shared.log("[Download] \(message)")
     }
 
-    static let appleMusicUnavailableMessage = "Unable to download using Apple Music. Please paste the Spotify URL."
+    static let appleMusicUnavailableMessage = "Unable to download using Apple Music. Please paste the Spotify or Deezer URL."
 
     private func downloadFailureMessage(for track: DownloadTrack, error: Error) -> String {
         guard track.provider == .appleMusic else {
-            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return Self.friendlyDownloadFailureMessage(for: error)
         }
         return Self.appleMusicUnavailableMessage
     }
 
-    private func updateLiveActivity(
-        trackName: String,
-        artistName: String,
-        progress: Double,
-        queueText: String,
-        speedBps: Double,
-        phase: DownloadLiveActivityAttributes.Phase
-    ) {
+    /// The technical form of a download error (raw HTTP status/body, backend JSON, low-level
+    /// `URLError` codes) is exactly what's useful in the console log, and exactly what a user
+    /// doesn't need staring back at them in the queue when a track fails. This is only ever the
+    /// user-facing summary shown after every backend candidate has been exhausted — the full
+    /// per-candidate error detail is still logged as each one fails (see
+    /// `executeCandidatesUntilSuccess`), so nothing is lost for actual debugging.
+    private static func friendlyDownloadFailureMessage(for error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "The download timed out. Check your connection and try again."
+            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed:
+                return "No internet connection."
+            case .cancelled:
+                return "Download cancelled."
+            default:
+                return "A network error occurred. Please try again."
+            }
+        }
+
+        if let downloadError = error as? DownloadError {
+            switch downloadError {
+            case .invalidURL, .mappingFailed:
+                return "This track isn't available right now."
+            case .searchFailed:
+                return "Search failed. Please try again."
+            case .remoteFailure, .httpError, .emptyResponse:
+                return "The download server had a problem. Please try again."
+            case .fileSaveFailed:
+                return "Couldn't save the downloaded file."
+            }
+        }
+
+        return "Download failed. Please try again."
+    }
+
+    /// Pushes the current set of concurrently-active downloads (name/progress each) to the
+    /// Live Activity. `phaseOverride` flags a transient moment (e.g. a track just entered
+    /// `.preparing`) without disturbing the other in-flight items' own progress.
+    private func pushLiveActivityUpdate(phaseOverride: DownloadLiveActivityAttributes.Phase? = nil) {
         guard backgroundDownloadsEnabled else { return }
+        let items: [DownloadLiveActivityAttributes.ActiveItem] = activeDownloadTrackIDs.sorted().compactMap { id in
+            guard let track = knownTracksByID[id] else { return nil }
+            return DownloadLiveActivityAttributes.ActiveItem(
+                trackName: track.name,
+                artistName: track.artistLine,
+                progress: downloadProgressByTrackID[id] ?? 0
+            )
+        }
         DownloadLiveActivityManager.shared.update(
-            trackName: trackName,
-            artistName: artistName,
-            progress: progress,
-            queueText: queueText,
-            speedBps: speedBps,
-            phase: phase
+            items: items,
+            queueText: queueCounterText,
+            speedBps: aggregateDownloadSpeedBps,
+            phase: phaseOverride ?? (isPaused ? .paused : .downloading)
         )
     }
 
-    private func endLiveActivity(
-        trackName: String,
-        artistName: String,
-        queueText: String,
-        phase: DownloadLiveActivityAttributes.Phase
-    ) {
+    /// Ends the Live Activity with `finalPhase` only once every active and pending download is
+    /// actually done — a single track finishing (successfully or not) while siblings are still
+    /// downloading just refreshes the activity with whoever's left, rather than dismissing it.
+    private func endLiveActivityIfQueueFinished(finalPhase: DownloadLiveActivityAttributes.Phase) {
         guard backgroundDownloadsEnabled else { return }
+        guard activeDownloadTrackIDs.isEmpty, pendingQueue.isEmpty else {
+            pushLiveActivityUpdate()
+            return
+        }
         DownloadLiveActivityManager.shared.end(
-            trackName: trackName,
-            artistName: artistName,
-            queueText: queueText,
-            phase: phase
+            queueText: "\(completedQueueCount)/\(totalQueueCount)",
+            phase: finalPhase
         )
     }
 
@@ -7903,87 +6951,25 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
-    private func handOffDownloadedFileForMainImport(_ fileURL: URL, trackID: String) {
+    private func handOffDownloadedFileForMainImport(_ fileURL: URL, track: DownloadTrack) {
         var pending = QueuePersistenceStore.loadPendingDownloadedImports()
-        if !pending.contains(where: { $0.localURLPath == fileURL.path || $0.trackID == trackID }) {
-            pending.append(.init(localURLPath: fileURL.path, trackID: trackID))
+        if !pending.contains(where: { $0.localURLPath == fileURL.path || $0.trackID == track.id }) {
+            pending.append(.init(localURLPath: fileURL.path, trackID: track.id, track: PersistedDownloadTrack(track: track)))
             QueuePersistenceStore.savePendingDownloadedImports(pending)
             NotificationCenter.default.post(name: .importDownloadedSongs, object: [fileURL])
             BackgroundMetadataFetchManager.shared.processPendingDownloadsInBackground()
         } else {
-            log("Download handoff already exists for track \(trackID); skipping notification.")
+            log("Download handoff already exists for track \(track.id); skipping notification.")
         }
     }
 
-    private func updateVisibleDownloadProgress(_ progress: Double, speedBps: Double) {
-        currentSongProgress = progress
-        currentDownloadSpeedBps = speedBps
-
-        guard let activeID = activeDownloadTrackID, let track = knownTracksByID[activeID] else { return }
-        updateLiveActivity(
-            trackName: track.name,
-            artistName: track.artistLine,
-            progress: progress,
-            queueText: queueCounterText,
-            speedBps: speedBps,
-            phase: isPaused ? .paused : .downloading
-        )
+    private func updateVisibleDownloadProgress(_ progress: Double, speedBps: Double, trackID: String) {
+        guard activeDownloadTrackIDs.contains(trackID) else { return }
+        downloadProgressByTrackID[trackID] = progress
+        downloadSpeedByTrackID[trackID] = speedBps
+        pushLiveActivityUpdate()
     }
 
-    private func restoreDeferredEnrichments() {
-        let restored = QueuePersistenceStore.loadDeferredDownloadEnrichments().compactMap { item -> DeferredDownloadEnrichment? in
-            guard let track = item.track.downloadTrack else { return nil }
-            let url = URL(fileURLWithPath: item.localURLPath)
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            return DeferredDownloadEnrichment(localURL: url, track: track)
-        }
-        deferredEnrichments = restored
-        if !restored.isEmpty {
-            log("Restored \(restored.count) deferred enrichment item(s).")
-        }
-        syncDeferredEnrichmentPersistence()
-    }
-
-    private func syncDeferredEnrichmentPersistence() {
-        let persisted = deferredEnrichments.map {
-            PersistedDeferredDownloadEnrichment(
-                localURLPath: $0.localURL.path,
-                track: PersistedDownloadTrack(track: $0.track)
-            )
-        }
-        QueuePersistenceStore.saveDeferredDownloadEnrichments(persisted)
-    }
-
-    func processDeferredEnrichmentIfNeeded() async {
-        guard !isProcessingDeferredEnrichments else { return }
-        guard !deferredEnrichments.isEmpty else { return }
-
-        isProcessingDeferredEnrichments = true
-        log("Starting deferred enrichment pass for \(deferredEnrichments.count) item(s).")
-        defer {
-            isProcessingDeferredEnrichments = false
-            syncDeferredEnrichmentPersistence()
-            log("Deferred enrichment pass ended. remaining=\(deferredEnrichments.count)")
-        }
-
-        var remaining: [DeferredDownloadEnrichment] = []
-
-        for item in deferredEnrichments {
-            do {
-                log("Deferred enrichment processing \(item.track.id) from \(item.localURL.lastPathComponent)")
-                var song = try await SongMetadata.fromURL(item.localURL)
-                let enriched = await enrichDownloadedSong(song, sourceTrack: item.track)
-                song = persistDownloadedSongIfNeeded(enriched)
-                enrichedSongs.append(song)
-                log("Deferred metadata enrichment finished for \(song.title).")
-            } catch {
-                log("Deferred metadata enrichment failed for \(item.localURL.lastPathComponent): \(error.localizedDescription)")
-                remaining.append(item)
-            }
-        }
-
-        deferredEnrichments = remaining
-    }
 
     private func restorePersistedQueue() {
         guard let snapshot = QueuePersistenceStore.loadDownloadQueue() else { return }
@@ -7998,11 +6984,15 @@ final class DownloadViewModel: ObservableObject {
         queueOrder = snapshot.queueOrder.filter { restoredTracks[$0] != nil }
         totalQueueCount = snapshot.totalQueueCount
         completedQueueCount = snapshot.completedQueueCount
-        restoredActiveTrackID = snapshot.activeID.flatMap { restoredTracks[$0] != nil ? $0 : nil }
+        restoredActiveTrackIDs = snapshot.activeIDs.filter { restoredTracks[$0] != nil }
 
         for id in snapshot.failedIDs where restoredTracks[id] != nil {
             trackStates[id] = .failed
             trackFailureReasons[id] = snapshot.failureReasons?[id]
+        }
+
+        for id in snapshot.doneIDs where restoredTracks[id] != nil {
+            trackStates[id] = .done
         }
 
         let pendingIDs = snapshot.pendingIDs.filter { restoredTracks[$0] != nil }
@@ -8011,13 +7001,13 @@ final class DownloadViewModel: ObservableObject {
             return restoredTracks[id]
         }
 
-        if totalQueueCount == 0 && (!pendingQueue.isEmpty || restoredActiveTrackID != nil || !snapshot.failedIDs.isEmpty) {
-            totalQueueCount = pendingQueue.count + snapshot.failedIDs.count + (restoredActiveTrackID == nil ? 0 : 1)
+        if totalQueueCount == 0 && (!pendingQueue.isEmpty || !restoredActiveTrackIDs.isEmpty || !snapshot.failedIDs.isEmpty) {
+            totalQueueCount = pendingQueue.count + snapshot.failedIDs.count + restoredActiveTrackIDs.count
         }
         completedQueueCount = min(completedQueueCount, totalQueueCount)
 
-        if restoredActiveTrackID != nil {
-            log("Found an active download to recover from the last session.")
+        if !restoredActiveTrackIDs.isEmpty {
+            log("Found \(restoredActiveTrackIDs.count) active download(s) to recover from the last session.")
         } else if !pendingQueue.isEmpty {
             log("Restored \(pendingQueue.count) queued download(s) from last session.")
             if backgroundDownloadsEnabled {
@@ -8032,19 +7022,28 @@ final class DownloadViewModel: ObservableObject {
     private func syncQueuePersistence() {
         let failedIDs = queueOrder.filter { trackStates[$0] == .failed }
         let pendingIDs = pendingQueue.map(\.id)
-        let hasMeaningfulState = !pendingIDs.isEmpty || activeDownloadTrackID != nil || !failedIDs.isEmpty
+        let hasMeaningfulState = !pendingIDs.isEmpty || !activeDownloadTrackIDs.isEmpty || !failedIDs.isEmpty
 
         guard hasMeaningfulState else {
             QueuePersistenceStore.clearDownloadQueue()
             return
         }
 
+        // Tracks finished in this session need to be persisted as `.done` too, not just folded
+        // into `completedQueueCount` — otherwise a relaunch mid-queue (some tracks done, others
+        // still pending/active) restores the aggregate counter correctly but drops every already
+        // -finished track's individual state back to `.idle`, which `queueSnapshot()` filters out
+        // entirely. The counter then shows e.g. 8/8 while the Queue Details sheet only lists the
+        // handful of tracks that finished after the relaunch.
+        let doneIDs = queueOrder.filter { trackStates[$0] == .done }
+
         let snapshot = PersistedDownloadQueue(
             tracksByID: knownTracksByID.mapValues(PersistedDownloadTrack.init),
             queueOrder: queueOrder,
             pendingIDs: pendingIDs,
             failedIDs: failedIDs,
-            activeID: activeDownloadTrackID,
+            activeIDs: Array(activeDownloadTrackIDs),
+            doneIDs: doneIDs,
             totalQueueCount: totalQueueCount,
             completedQueueCount: completedQueueCount,
             failureReasons: trackFailureReasons.filter { failedIDs.contains($0.key) }
@@ -8060,6 +7059,7 @@ final class DownloadViewModel: ObservableObject {
             guard state != .idle else { continue }
 
             let queueIndex = pendingQueue.firstIndex(where: { $0.id == id })
+            let isActive = activeDownloadTrackIDs.contains(id)
             items.append(
                 .init(
                     id: id,
@@ -8067,9 +7067,11 @@ final class DownloadViewModel: ObservableObject {
                     artist: track.artistLine,
                     album: track.albumName,
                     state: state,
-                    isActive: activeDownloadTrackID == id,
+                    isActive: isActive,
+                    progress: isActive ? (downloadProgressByTrackID[id] ?? 0) : 0,
                     queueIndex: queueIndex,
-                    failureReason: state == .failed ? trackFailureReasons[id] : nil
+                    failureReason: state == .failed ? trackFailureReasons[id] : nil,
+                    qualityNote: state == .done ? trackQualityNotes[id] : nil
                 )
             )
         }
@@ -8085,9 +7087,9 @@ final class DownloadViewModel: ObservableObject {
             queuedItems: queuedItems,
             doneItems: doneItems,
             failedItems: failedItems,
-            currentSongProgress: currentSongProgress,
+            aggregateProgress: aggregateDownloadProgress,
             queueCounterText: queueCounterText,
-            currentDownloadSpeedBps: currentDownloadSpeedBps
+            aggregateSpeedBps: aggregateDownloadSpeedBps
         )
     }
 }
@@ -8100,27 +7102,32 @@ struct DownloadQueueSnapshot {
         let album: String
         let state: DownloadTrackState
         let isActive: Bool
+        let progress: Double
         let queueIndex: Int?
         let failureReason: String?
+        let qualityNote: String?
     }
 
     let activeItems: [Item]
     let queuedItems: [Item]
     let doneItems: [Item]
     let failedItems: [Item]
-    let currentSongProgress: Double
+    /// Overall batch progress across every currently-active download, not any single track's.
+    let aggregateProgress: Double
     let queueCounterText: String
-    let currentDownloadSpeedBps: Double
+    let aggregateSpeedBps: Double
 }
 
 struct DownloadQueueDetailsSheet: View {
     @ObservedObject var vm: DownloadViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var spotifySearchItem: DownloadQueueSnapshot.Item?
+    @State private var deezerSearchItem: DownloadQueueSnapshot.Item?
     @State private var copiedItemID: String?
+    @State private var copiedDeezerItemID: String?
     @State private var showCopiedBanner = false
 
-    private func spotifySearchQuery(for item: DownloadQueueSnapshot.Item) -> String {
+    private func trackSearchQuery(for item: DownloadQueueSnapshot.Item) -> String {
         let strippedFeaturing = item.name.replacingOccurrences(
             of: #"\s*[\(\[](?:feat(?:\.|uring)?|ft\.?)\b[^\)\]]*[\)\]]"#,
             with: "",
@@ -8134,8 +7141,13 @@ struct DownloadQueueDetailsSheet: View {
     }
 
     private func spotifySearchURL(for item: DownloadQueueSnapshot.Item) -> URL {
-        let encoded = spotifySearchQuery(for: item)
+        let encoded = trackSearchQuery(for: item)
         return URL(string: "https://open.spotify.com/search/\(encoded)") ?? URL(string: "https://open.spotify.com")!
+    }
+
+    private func deezerSearchURL(for item: DownloadQueueSnapshot.Item) -> URL {
+        let encoded = trackSearchQuery(for: item)
+        return URL(string: "https://www.deezer.com/search/\(encoded)") ?? URL(string: "https://www.deezer.com")!
     }
 
     private func findOnSpotify(_ item: DownloadQueueSnapshot.Item) {
@@ -8150,6 +7162,18 @@ struct DownloadQueueDetailsSheet: View {
         spotifySearchItem = item
     }
 
+    private func findOnDeezer(_ item: DownloadQueueSnapshot.Item) {
+        UIPasteboard.general.string = "\(item.artist) \(item.name)"
+        copiedDeezerItemID = item.id
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if copiedDeezerItemID == item.id {
+                copiedDeezerItemID = nil
+            }
+        }
+        deezerSearchItem = item
+    }
+
     var body: some View {
         let snapshot = vm.queueSnapshot()
 
@@ -8158,7 +7182,7 @@ struct DownloadQueueDetailsSheet: View {
                 Section {
                     HStack(spacing: 12) {
                         DownloadQueueIndicator(
-                            progress: snapshot.currentSongProgress,
+                            progress: snapshot.aggregateProgress,
                             label: snapshot.queueCounterText
                         )
                         VStack(alignment: .leading, spacing: 4) {
@@ -8237,22 +7261,22 @@ struct DownloadQueueDetailsSheet: View {
                     if !snapshot.activeItems.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
-                                Text("Current Progress")
+                                Text(snapshot.activeItems.count > 1 ? "Overall Progress" : "Current Progress")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 Spacer()
-                                Text("\(Int(snapshot.currentSongProgress * 100))%")
+                                Text("\(Int(snapshot.aggregateProgress * 100))%")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                             }
-                            ProgressView(value: snapshot.currentSongProgress)
+                            ProgressView(value: snapshot.aggregateProgress)
                                 .tint(.accentColor)
                             HStack {
                                 Text("Speed")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 Spacer()
-                                Text(formattedSpeed(snapshot.currentDownloadSpeedBps))
+                                Text(formattedSpeed(snapshot.aggregateSpeedBps))
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                             }
@@ -8275,9 +7299,16 @@ struct DownloadQueueDetailsSheet: View {
                             queueRow(item)
                         }
                         .onDelete { offsets in
-                            let items = snapshot.queuedItems
-                            for index in offsets {
-                                vm.removeQueued(trackID: items[index].id)
+                            let ids = offsets.map { snapshot.queuedItems[$0].id }
+                            // Deferred a tick: removing the section's last row and the
+                            // conditional `if !snapshot.queuedItems.isEmpty` Section vanishing
+                            // in the same SwiftUI transaction crashes List's diffing. Letting
+                            // the delete animation finish before the model mutation lands
+                            // avoids it.
+                            DispatchQueue.main.async {
+                                for id in ids {
+                                    vm.removeQueued(trackID: id)
+                                }
                             }
                         }
                     }
@@ -8292,14 +7323,24 @@ struct DownloadQueueDetailsSheet: View {
                 }
 
                 if !snapshot.failedItems.isEmpty {
-                    Section("Failed") {
+                    Section {
                         ForEach(snapshot.failedItems) { item in
                             queueRow(item)
                         }
                         .onDelete { offsets in
-                            let items = snapshot.failedItems
-                            for index in offsets {
-                                vm.removeFailed(trackID: items[index].id)
+                            let ids = offsets.map { snapshot.failedItems[$0].id }
+                            DispatchQueue.main.async {
+                                for id in ids {
+                                    vm.removeFailed(trackID: id)
+                                }
+                            }
+                        }
+                    } header: {
+                        HStack {
+                            Text("Failed")
+                            Spacer()
+                            Button("Clear All") {
+                                vm.clearAllFailed()
                             }
                         }
                     }
@@ -8316,6 +7357,39 @@ struct DownloadQueueDetailsSheet: View {
         .sheet(item: $spotifySearchItem) { item in
             ZStack(alignment: .bottom) {
                 SafariSheetView(url: spotifySearchURL(for: item))
+                    .ignoresSafeArea()
+
+                if showCopiedBanner {
+                    HStack(spacing: 10) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Text("Copied. Paste it in the search bar.")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(.primary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(.thinMaterial)
+                    .clipShape(Capsule())
+                    .shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 5)
+                    .padding(.bottom, 30)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .onAppear {
+                withAnimation(.spring()) {
+                    showCopiedBanner = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    withAnimation(.easeOut) {
+                        showCopiedBanner = false
+                    }
+                }
+            }
+        }
+        .sheet(item: $deezerSearchItem) { item in
+            ZStack(alignment: .bottom) {
+                SafariSheetView(url: deezerSearchURL(for: item))
                     .ignoresSafeArea()
 
                 if showCopiedBanner {
@@ -8392,20 +7466,40 @@ struct DownloadQueueDetailsSheet: View {
                         .padding(.top, 1)
 
                     if failureReason == DownloadViewModel.appleMusicUnavailableMessage {
-                        Button {
-                            findOnSpotify(item)
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: copiedItemID == item.id ? "checkmark" : "magnifyingglass")
-                                    .font(.caption2)
-                                Text(copiedItemID == item.id ? "Copied, opening Spotify search…" : "Find on Spotify")
-                                    .font(.caption2.weight(.semibold))
+                        HStack(spacing: 14) {
+                            Button {
+                                findOnSpotify(item)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: copiedItemID == item.id ? "checkmark" : "magnifyingglass")
+                                        .font(.caption2)
+                                    Text(copiedItemID == item.id ? "Copied, opening Spotify search…" : "Find on Spotify")
+                                        .font(.caption2.weight(.semibold))
+                                }
                             }
+                            .buttonStyle(.plain)
+                            .foregroundColor(.accentColor)
+
+                            Button {
+                                findOnDeezer(item)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: copiedDeezerItemID == item.id ? "checkmark" : "magnifyingglass")
+                                        .font(.caption2)
+                                    Text(copiedDeezerItemID == item.id ? "Copied, opening Deezer search…" : "Find on Deezer")
+                                        .font(.caption2.weight(.semibold))
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(.accentColor)
                         }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.accentColor)
                         .padding(.top, 2)
                     }
+                }
+                if item.isActive, item.state == .downloading {
+                    ProgressView(value: item.progress)
+                        .tint(.accentColor)
+                        .padding(.top, 3)
                 }
             }
 

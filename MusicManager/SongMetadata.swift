@@ -104,6 +104,30 @@ struct SongMetadata: Identifiable {
         return !xid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Short codec label for display (FLAC/ALAC/AAC/MP3/...), read from the local file's actual
+    /// audio codec (`inspectLocalAudioCharacteristics`), not inferred from file extension. Falls
+    /// back to the file extension when the codec wasn't captured (e.g. `playbackCodecType == 0`).
+    var audioFormatLabel: String {
+        switch AudioFormatID(playbackCodecType) {
+        case kAudioFormatAppleLossless: return "ALAC"
+        case kAudioFormatFLAC: return "FLAC"
+        case kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE, kAudioFormatMPEG4AAC_HE_V2, kAudioFormatMPEG4AAC_LD:
+            return "AAC"
+        case kAudioFormatMPEGLayer3: return "MP3"
+        case kAudioFormatOpus: return "Opus"
+        case kAudioFormatLinearPCM:
+            let ext = localURL.pathExtension.lowercased()
+            return ext == "aiff" || ext == "aif" ? "AIFF" : "WAV"
+        default:
+            let ext = localURL.pathExtension
+            return ext.isEmpty ? "—" : ext.uppercased()
+        }
+    }
+
+    var isLosslessAudio: Bool {
+        audioFormatLabel == "FLAC" || audioFormatLabel == "ALAC"
+    }
+
     var appleMetadataCoverageSummary: String {
         let flags = [
             "storeId=\(storeId)",
@@ -1674,6 +1698,30 @@ struct LyricsSearchResult: Identifiable {
 }
 
 extension SongMetadata {
+    static let storefrontMap: [String: Int64] = [
+        "us": 143441, "gb": 143444, "ca": 143455, "au": 143460,
+        "de": 143443, "fr": 143442, "jp": 143462, "mx": 143468,
+        "es": 143454, "it": 143450, "br": 143503, "kr": 143466,
+        "cn": 143465, "in": 143467, "ru": 143469, "se": 143456,
+        "nl": 143452, "no": 143457, "dk": 143458, "fi": 143447,
+        "at": 143445, "ch": 143459, "be": 143446, "ie": 143449,
+        "nz": 143461, "sg": 143464, "hk": 143463, "tw": 143470,
+        "ar": 143505, "cl": 143483, "co": 143501, "pe": 143507,
+        "ve": 143502, "ec": 143509, "cr": 143495, "pa": 143485,
+        "do": 143508, "gt": 143504, "hn": 143510, "sv": 143506,
+        "py": 143513, "uy": 143514, "bo": 143516, "ni": 143512,
+        "pr": 143522, "ph": 143474, "th": 143475, "my": 143473,
+        "id": 143476, "vn": 143471, "pk": 143477, "eg": 143516,
+        "sa": 143479, "ae": 143481, "il": 143491, "za": 143472,
+        "ng": 143561, "ke": 143529, "pt": 143453, "pl": 143478,
+        "tr": 143480, "ua": 143492, "ro": 143487, "hu": 143482,
+        "cz": 143489, "gr": 143448, "sk": 143496, "bg": 143526,
+        "hr": 143494, "lt": 143520, "lv": 143519, "ee": 143518,
+        "si": 143499, "lu": 143451, "mt": 143521
+    ]
+}
+
+extension SongMetadata {
     static func searchLyrics(query: String, service: LyricsSearchService) async -> [LyricsSearchResult] {
         switch service {
         case .lrclib:
@@ -1977,28 +2025,7 @@ extension SongMetadata {
         }
         
         let region = UserDefaults.standard.string(forKey: "storeRegion")?.lowercased() ?? "us"
-        let storefrontMap: [String: Int64] = [
-            "us": 143441, "gb": 143444, "ca": 143455, "au": 143460,
-            "de": 143443, "fr": 143442, "jp": 143462, "mx": 143468,
-            "es": 143454, "it": 143450, "br": 143503, "kr": 143466,
-            "cn": 143465, "in": 143467, "ru": 143469, "se": 143456,
-            "nl": 143452, "no": 143457, "dk": 143458, "fi": 143447,
-            "at": 143445, "ch": 143459, "be": 143446, "ie": 143449,
-            "nz": 143461, "sg": 143464, "hk": 143463, "tw": 143470,
-            "ar": 143505, "cl": 143483, "co": 143501, "pe": 143507,
-            "ve": 143502, "ec": 143509, "cr": 143495, "pa": 143485,
-            "do": 143508, "gt": 143504, "hn": 143510, "sv": 143506,
-            "py": 143513, "uy": 143514, "bo": 143516, "ni": 143512,
-            "pr": 143522, "ph": 143474, "th": 143475, "my": 143473,
-            "id": 143476, "vn": 143471, "pk": 143477, "eg": 143516,
-            "sa": 143479, "ae": 143481, "il": 143491, "za": 143472,
-            "ng": 143561, "ke": 143529, "pt": 143453, "pl": 143478,
-            "tr": 143480, "ua": 143492, "ro": 143487, "hu": 143482,
-            "cz": 143489, "gr": 143448, "sk": 143496, "bg": 143526,
-            "hr": 143494, "lt": 143520, "lv": 143519, "ee": 143518,
-            "si": 143499, "lu": 143451, "mt": 143521
-        ]
-        enrichedSong.storefrontId = storefrontMap[region] ?? 143441
+        enrichedSong.storefrontId = SongMetadata.storefrontMap[region] ?? 143441
         
         if let artworkUrl = amsMatch.attributes.artwork?.artworkURL() {
             if let (data, _) = try? await SongMetadataNetworking.data(from: artworkUrl) {
@@ -2152,13 +2179,13 @@ extension SongMetadata {
     static func enrichWithAppleMusicMetadata(_ song: SongMetadata) async -> SongMetadata {
         Logger.shared.log("[SongMetadata] Performing full Apple Music fetch for: \(song.artist) - \(song.title)")
         let query = "\(song.artist) \(song.title)"
-        
-        if let amsMatch = await AppleMusicAPI.shared.searchSong(query: query) {
+
+        if let amsMatch = await AppleMusicAPI.shared.searchSong(query: query, albumHint: song.album) {
             let enriched = await applyAppleMusicMatch(amsMatch, to: song)
             Logger.shared.log("[SongMetadata] ✓ Apple Music match (\(enriched.appleMetadataMatchTier)): \(enriched.title) (\(enriched.storeId))")
             return enriched
         }
-        
+
         Logger.shared.log("[SongMetadata] Apple Music fetch returned no match for: \(song.artist) - \(song.title)")
         return song
     }
@@ -2179,8 +2206,8 @@ extension SongMetadata {
     static func matchAppleMusicMetadata(_ song: SongMetadata) async -> SongMetadata {
         let query = "\(song.artist) \(song.title)"
         Logger.shared.log("[SongMetadata] 🔍 Shadow-searching Apple Music for rich metadata: '\(query)'")
-        
-        if let amsMatch = await AppleMusicAPI.shared.searchSong(query: query) {
+
+        if let amsMatch = await AppleMusicAPI.shared.searchSong(query: query, albumHint: song.album) {
             Logger.shared.log("[SongMetadata] ✨ Found Apple Music Server Match: \(amsMatch.attributes.name) by \(amsMatch.attributes.artistName) (ID: \(amsMatch.id))")
             let enriched = await applyAppleMusicMatch(amsMatch, to: song)
             Logger.shared.log("[SongMetadata] ✨ Rich Apple metadata tier: \(enriched.appleMetadataMatchTier) for \(enriched.title)")
@@ -2189,6 +2216,47 @@ extension SongMetadata {
             Logger.shared.log("[SongMetadata] ⚠️ No rich metadata match found on Apple Music for: '\(query)'")
         }
         
+        return song
+    }
+
+    static func enrichDownloadedSong(_ initialSong: SongMetadata, sourceTrack: DownloadTrack? = nil) async -> SongMetadata {
+        var song = initialSong
+
+        if let sourceTrack {
+            song = await enrichWithExactAppleMusicTrack(song, trackID: sourceTrack.id, urlHint: sourceTrack.sourceURL)
+            if song.storeId == 0 {
+                song = await enrichWithAppleMusicMetadata(song)
+            }
+        } else {
+            let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "local"
+            let autofetch = UserDefaults.standard.bool(forKey: "autofetchMetadata")
+
+            if metadataSource == "apple" && autofetch {
+                song = await enrichWithAppleMusicMetadata(song)
+            } else if metadataSource == "itunes" && autofetch {
+                song = await enrichWithiTunesMetadata(song)
+            } else if metadataSource == "deezer" && autofetch {
+                song = await enrichWithDeezerMetadata(song)
+            } else if metadataSource == "local" && autofetch {
+                if UserDefaults.standard.bool(forKey: "appleRichMetadata") {
+                    song = await matchAppleMusicMetadata(song)
+                }
+            }
+        }
+
+        let fetchLyricsEnabled = UserDefaults.standard.bool(forKey: "fetchLyrics")
+        let appleSubscriptionLyrics = UserDefaults.standard.bool(forKey: "appleSubscriptionLyrics")
+        if fetchLyricsEnabled && !appleSubscriptionLyrics && (song.lyrics == nil || song.lyrics?.isEmpty == true) {
+            if let fetchedLyrics = await SongMetadata.fetchLyrics(
+                title: song.title,
+                artist: song.artist,
+                album: song.album,
+                durationMs: song.durationMs
+            ) {
+                song.lyrics = fetchedLyrics
+            }
+        }
+
         return song
     }
 }
@@ -2219,10 +2287,12 @@ struct DeezerSong: Codable, Identifiable {
 }
 
 struct DeezerReference: Codable {
+    let id: Int
     let name: String
 }
 
 struct DeezerAlbumReference: Codable {
+    let id: Int
     let title: String
     let cover_xl: String
 }
@@ -2230,7 +2300,47 @@ struct DeezerAlbumReference: Codable {
 struct DeezerTrackDetails: Codable {
     let track_position: Int?
     let disk_number: Int?
-    let release_date: String? 
+    let release_date: String?
+}
+
+struct DeezerTracksWrapper: Codable {
+    let data: [DeezerSong]
+}
+
+struct DeezerAlbumDetail: Codable {
+    let id: Int
+    let title: String
+    let cover_xl: String
+    let artist: DeezerReference
+    let tracks: DeezerTracksWrapper
+}
+
+struct DeezerPlaylistDetail: Codable {
+    let id: Int
+    let title: String
+    let picture_xl: String
+    let creator: DeezerReference
+    let tracks: DeezerTracksWrapper
+}
+
+struct DeezerArtistDetail: Codable {
+    let id: Int
+    let name: String
+    let picture_xl: String
+}
+
+struct DeezerArtistTopTracksResult: Codable {
+    let data: [DeezerSong]
+}
+
+struct DeezerArtistAlbumSummary: Codable {
+    let id: Int
+    let title: String
+    let cover_xl: String
+}
+
+struct DeezerArtistAlbumsResult: Codable {
+    let data: [DeezerArtistAlbumSummary]
 }
 
 
@@ -2265,6 +2375,78 @@ extension SongMetadata {
         } catch {
             Logger.shared.log("[SongMetadata] Failed to fetch Deezer track details: \(error)")
             return nil
+        }
+    }
+
+    static func fetchDeezerTrack(id: Int) async -> DeezerSong? {
+        guard let url = URL(string: "https://api.deezer.com/track/\(id)") else { return nil }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerSong.self, from: data)
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer track fetch failed for \(id): \(error)")
+            return nil
+        }
+    }
+
+    static func fetchDeezerAlbum(id: Int) async -> DeezerAlbumDetail? {
+        guard let url = URL(string: "https://api.deezer.com/album/\(id)") else { return nil }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerAlbumDetail.self, from: data)
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer album fetch failed for \(id): \(error)")
+            return nil
+        }
+    }
+
+    static func fetchDeezerPlaylist(id: Int) async -> DeezerPlaylistDetail? {
+        guard let url = URL(string: "https://api.deezer.com/playlist/\(id)") else { return nil }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerPlaylistDetail.self, from: data)
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer playlist fetch failed for \(id): \(error)")
+            return nil
+        }
+    }
+
+    static func fetchDeezerArtist(id: Int) async -> DeezerArtistDetail? {
+        guard let url = URL(string: "https://api.deezer.com/artist/\(id)") else { return nil }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerArtistDetail.self, from: data)
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer artist fetch failed for \(id): \(error)")
+            return nil
+        }
+    }
+
+    static func fetchDeezerArtistTopTracks(id: Int, limit: Int = 100) async -> [DeezerSong] {
+        guard let url = URL(string: "https://api.deezer.com/artist/\(id)/top?limit=\(limit)") else { return [] }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerArtistTopTracksResult.self, from: data).data
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer artist top tracks fetch failed for \(id): \(error)")
+            return []
+        }
+    }
+
+    static func fetchDeezerArtistAlbums(id: Int, limit: Int = 100) async -> [DeezerArtistAlbumSummary] {
+        guard let url = URL(string: "https://api.deezer.com/artist/\(id)/albums?limit=\(limit)") else { return [] }
+
+        do {
+            let (data, _) = try await SongMetadataNetworking.data(from: url)
+            return try JSONDecoder().decode(DeezerArtistAlbumsResult.self, from: data).data
+        } catch {
+            Logger.shared.log("[SongMetadata] Deezer artist albums fetch failed for \(id): \(error)")
+            return []
         }
     }
 
@@ -2614,8 +2796,15 @@ actor AppleMusicAPI {
         return await searchSongsViaPublicSearch(query: query, limit: limit, offset: offset)
     }
 
-    func searchSong(query: String) async -> AppleMusicSong? {
-        guard let song = await searchSongs(query: query, limit: 1, offset: 0).first else {
+    func searchSong(query: String, albumHint: String? = nil) async -> AppleMusicSong? {
+        let candidates: [AppleMusicSong]
+        if let albumHint, !albumHint.isEmpty, albumHint != "Unknown Album" {
+            candidates = await searchSongs(query: query, limit: 5, offset: 0)
+        } else {
+            candidates = await searchSongs(query: query, limit: 1, offset: 0)
+        }
+
+        guard let song = Self.bestMatch(for: candidates, albumHint: albumHint) else {
             return nil
         }
 
@@ -2628,6 +2817,23 @@ actor AppleMusicAPI {
         }
 
         return song
+    }
+
+    private static func bestMatch(for candidates: [AppleMusicSong], albumHint: String?) -> AppleMusicSong? {
+        guard let albumHint, !albumHint.isEmpty, albumHint != "Unknown Album" else {
+            return candidates.first
+        }
+
+        let normalizedHint = albumHint.lowercased().filter { !$0.isPunctuation }
+        if let albumMatch = candidates.first(where: { candidate in
+            guard let candidateAlbum = candidate.attributes.albumName else { return false }
+            let normalizedCandidate = candidateAlbum.lowercased().filter { !$0.isPunctuation }
+            return normalizedCandidate.contains(normalizedHint) || normalizedHint.contains(normalizedCandidate)
+        }) {
+            return albumMatch
+        }
+
+        return candidates.first
     }
 
     func fetchSong(id: String, urlHint: String? = nil) async -> AppleMusicSong? {

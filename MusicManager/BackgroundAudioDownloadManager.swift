@@ -5,9 +5,6 @@ struct BackgroundDownloadRequestContext: Codable {
     let backendLabel: String
     let suggestedName: String
     let fallbackExtension: String
-    let trackName: String?
-    let artistName: String?
-    let queueText: String?
 }
 
 struct BackgroundDownloadResult {
@@ -36,6 +33,29 @@ enum BackgroundDownloadManagerError: LocalizedError {
 final class BackgroundAudioDownloadManager: NSObject {
     static let shared = BackgroundAudioDownloadManager()
     static let sessionIdentifier = "com.musicmanager.downloads.background"
+
+    // A background download can finish while nothing is listening (app woken purely for
+    // `handleEventsForBackgroundURLSession`, before `DownloadViewModel` ever gets created) and
+    // then get killed before anyone claims the result. `pendingResultsByTrackID` alone doesn't
+    // survive that — it's wiped along with the rest of process memory — so a fresh launch's
+    // recovery pass finds no matching task and no pending result, and just re-downloads the
+    // track from scratch even though the file already finished. Mirroring successful results to
+    // disk here closes that gap: `consumePendingResult` falls back to this store, so recovery
+    // after a relaunch can still pick up the already-downloaded file.
+    private struct PersistedPendingResult: Codable {
+        let trackID: String
+        let filePath: String
+        let backendLabel: String
+        let suggestedName: String
+        let fallbackExtension: String
+        let statusCode: Int
+        let url: String?
+        let headerFields: [String: String]
+        let createdAt: Date
+    }
+
+    private static let pendingResultsDefaultsKey = "BackgroundAudioDownloadManager.pendingResults.v1"
+    private static let pendingResultMaxAge: TimeInterval = 24 * 60 * 60
 
     private struct TransferState {
         var progressHandler: ((Double, Double) -> Void)?
@@ -67,6 +87,9 @@ final class BackgroundAudioDownloadManager: NSObject {
 
     private override init() {
         super.init()
+        stateQueue.async {
+            _ = self.loadPersistedPendingResults()
+        }
     }
 
     func setBackgroundEventsCompletionHandler(_ handler: (() -> Void)?) {
@@ -197,6 +220,9 @@ final class BackgroundAudioDownloadManager: NSObject {
             if completion == nil, let trackID = self.context(for: task)?.trackID {
                 self.pendingResultsByTrackID[trackID] = result
                 self.log("Stored pending result for task id=\(task.taskIdentifier) track=\(trackID) because no completion handler was attached")
+                if case .success(let value) = result {
+                    self.persistPendingResult(value)
+                }
             }
             self.log("Finishing background task id=\(task.taskIdentifier) result=\(self.describe(result))")
             DispatchQueue.main.async {
@@ -208,10 +234,108 @@ final class BackgroundAudioDownloadManager: NSObject {
     private func consumePendingResult(forTrackID trackID: String) async -> Result<BackgroundDownloadResult, Error>? {
         await withCheckedContinuation { continuation in
             stateQueue.async {
-                let result = self.pendingResultsByTrackID.removeValue(forKey: trackID)
-                continuation.resume(returning: result)
+                if let result = self.pendingResultsByTrackID.removeValue(forKey: trackID) {
+                    if case .success = result {
+                        self.removePersistedPendingResult(forTrackID: trackID)
+                    }
+                    continuation.resume(returning: result)
+                    return
+                }
+
+                if let persisted = self.loadPersistedPendingResults()[trackID] {
+                    self.removePersistedPendingResult(forTrackID: trackID)
+                    if let reconstructed = self.reconstructResult(from: persisted) {
+                        self.log("Recovered persisted pending result from disk for track \(trackID)")
+                        continuation.resume(returning: .success(reconstructed))
+                        return
+                    }
+                    self.log("Persisted pending result for track \(trackID) referenced a missing file; discarding")
+                }
+
+                continuation.resume(returning: nil)
             }
         }
+    }
+
+    private func persistPendingResult(_ result: BackgroundDownloadResult) {
+        let httpResponse = result.response as? HTTPURLResponse
+        var headerFields: [String: String] = [:]
+        if let httpResponse {
+            for (key, value) in httpResponse.allHeaderFields {
+                if let key = key as? String, let value = value as? String {
+                    headerFields[key] = value
+                }
+            }
+        }
+
+        let persisted = PersistedPendingResult(
+            trackID: result.context.trackID,
+            filePath: result.fileURL.path,
+            backendLabel: result.context.backendLabel,
+            suggestedName: result.context.suggestedName,
+            fallbackExtension: result.context.fallbackExtension,
+            statusCode: httpResponse?.statusCode ?? 200,
+            url: result.response.url?.absoluteString,
+            headerFields: headerFields,
+            createdAt: Date()
+        )
+
+        var all = loadPersistedPendingResults(pruneStale: false)
+        all[persisted.trackID] = persisted
+        savePersistedPendingResults(all)
+        log("Persisted pending result to disk for track \(persisted.trackID)")
+    }
+
+    private func removePersistedPendingResult(forTrackID trackID: String) {
+        var all = loadPersistedPendingResults(pruneStale: false)
+        guard all.removeValue(forKey: trackID) != nil else { return }
+        savePersistedPendingResults(all)
+    }
+
+    private func loadPersistedPendingResults(pruneStale: Bool = true) -> [String: PersistedPendingResult] {
+        guard let data = UserDefaults.standard.data(forKey: Self.pendingResultsDefaultsKey),
+              let decoded = try? JSONDecoder().decode([String: PersistedPendingResult].self, from: data) else {
+            return [:]
+        }
+
+        guard pruneStale else { return decoded }
+
+        let cutoff = Date().addingTimeInterval(-Self.pendingResultMaxAge)
+        let fresh = decoded.filter { $0.value.createdAt > cutoff && FileManager.default.fileExists(atPath: $0.value.filePath) }
+        if fresh.count != decoded.count {
+            savePersistedPendingResults(fresh)
+        }
+        return fresh
+    }
+
+    private func savePersistedPendingResults(_ results: [String: PersistedPendingResult]) {
+        if results.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.pendingResultsDefaultsKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(results) else { return }
+        UserDefaults.standard.set(data, forKey: Self.pendingResultsDefaultsKey)
+    }
+
+    private func reconstructResult(from persisted: PersistedPendingResult) -> BackgroundDownloadResult? {
+        let fileURL = URL(fileURLWithPath: persisted.filePath)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+
+        let responseURL = persisted.url.flatMap(URL.init(string:)) ?? fileURL
+        let response = HTTPURLResponse(
+            url: responseURL,
+            statusCode: persisted.statusCode,
+            httpVersion: nil,
+            headerFields: persisted.headerFields
+        ) ?? URLResponse(url: responseURL, mimeType: nil, expectedContentLength: -1, textEncodingName: nil)
+
+        let context = BackgroundDownloadRequestContext(
+            trackID: persisted.trackID,
+            backendLabel: persisted.backendLabel,
+            suggestedName: persisted.suggestedName,
+            fallbackExtension: persisted.fallbackExtension
+        )
+        return BackgroundDownloadResult(fileURL: fileURL, response: response, context: context)
     }
 
     private func saveDownloadedFile(
@@ -244,7 +368,7 @@ final class BackgroundAudioDownloadManager: NSObject {
     private func redactedURLString(_ url: URL?) -> String {
         guard let url else { return "<unknown>" }
         if url.host?.caseInsensitiveCompare(Config.byeTunesApiHost) == .orderedSame {
-            return "ByeTunes API"
+            return Config.downloadBackendLabel
         }
         return url.absoluteString
     }
@@ -326,21 +450,8 @@ extension BackgroundAudioDownloadManager: URLSessionDownloadDelegate, URLSession
 
             let progressHandler = state.progressHandler
             let speed = state.smoothedSpeedBps
-            let context = self.context(for: downloadTask)
             DispatchQueue.main.async {
                 progressHandler?(fraction, speed)
-            }
-            if let context {
-                Task { @MainActor in
-                    DownloadLiveActivityManager.shared.update(
-                        trackName: context.trackName ?? context.suggestedName,
-                        artistName: context.artistName ?? "",
-                        progress: fraction,
-                        queueText: context.queueText ?? "",
-                        speedBps: speed,
-                        phase: .downloading
-                    )
-                }
             }
         }
     }

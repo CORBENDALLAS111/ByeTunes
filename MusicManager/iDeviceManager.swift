@@ -29,11 +29,14 @@ let IdeviceSuccess: IdeviceErrorCode = nil
 
 enum PairingFileImportError: LocalizedError {
     case invalidFileType(expected: String)
+    case wrongFormatForOSVersion(expected: String, detectedOther: String)
 
     var errorDescription: String? {
         switch self {
         case .invalidFileType(let expected):
-            return "That file is not a valid \(expected)."
+            return "That file is not a valid \(expected). Make sure you exported it correctly and try again."
+        case .wrongFormatForOSVersion(let expected, let detectedOther):
+            return "This looks like a \(detectedOther), but your iPhone's current iOS version needs a \(expected) instead. Export the correct file type and try again."
         }
     }
 }
@@ -60,6 +63,8 @@ class DeviceManager: ObservableObject {
         let title: String
         let artist: String
         let album: String
+        let albumPid: Int64
+        let albumArtist: String
         let genre: String
         let year: Int
         let durationMs: Int
@@ -134,6 +139,9 @@ class DeviceManager: ObservableObject {
     var rpHandshake: RsdHandshakeHandle?
     var heartbeatThread: Thread?
     private var heartbeatSessionID: UInt64 = 0
+    private var isReconnecting = false
+    private var pendingReconnectCompletions: [(Bool) -> Void] = []
+    private let reconnectCoordinationLock = NSLock()
     nonisolated(unsafe) var artworkRepairCancelled: Bool = false
     private var autoReconnectTimer: DispatchSourceTimer?
     private var lastHeartbeatAttemptStartedAt: Date = .distantPast
@@ -437,6 +445,13 @@ class DeviceManager: ObservableObject {
         hasValidExpectedPairingFile = validateExpectedPairingFile()
     }
 
+    /// Validates the picked file *before* it ever touches `expectedPairingFile`, and commits it
+    /// with an atomic replace rather than delete-then-copy. Previously a failing import would
+    /// first delete whatever pairing file was already there, then copy the new one in — if the
+    /// copy failed partway (interrupted, disk pressure, a revoked security scope), the user was
+    /// left with no pairing file at all, worse off than before they tried to update it. Validating
+    /// a scratch copy first means a bad file is simply rejected, leaving the existing working file
+    /// (if any) completely untouched.
     func importPairingFile(from url: URL) throws {
         let needsSecurityScope = url.startAccessingSecurityScopedResource()
         defer {
@@ -449,17 +464,39 @@ class DeviceManager: ObservableObject {
         if !FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
-        if FileManager.default.fileExists(atPath: expectedPairingFile.path) {
-            try FileManager.default.removeItem(at: expectedPairingFile)
-        }
-        try FileManager.default.copyItem(at: url, to: expectedPairingFile)
 
-        refreshExpectedPairingFileState()
-        guard hasValidExpectedPairingFile else {
-            try? FileManager.default.removeItem(at: expectedPairingFile)
-            refreshExpectedPairingFileState()
+        let tempURL = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
+        try? FileManager.default.removeItem(at: tempURL)
+        try FileManager.default.copyItem(at: url, to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let matchesExpectedFormat = requiresRPPairingTunnel
+            ? validateRPPairingFile(at: tempURL)
+            : validateLockdownPairingFile(at: tempURL)
+
+        guard matchesExpectedFormat else {
+            // Two incompatible pairing file formats exist depending on the host iPhone's OS
+            // version (see `requiresRPPairingTunnel`) — picking the wrong export for your current
+            // OS is an easy mistake, so check for that specifically rather than a bare "invalid".
+            let matchesOtherFormat = requiresRPPairingTunnel
+                ? validateLockdownPairingFile(at: tempURL)
+                : validateRPPairingFile(at: tempURL)
+
+            if matchesOtherFormat {
+                let otherTitle = requiresRPPairingTunnel ? "classic Pairing File" : "RP Pairing File"
+                throw PairingFileImportError.wrongFormatForOSVersion(expected: expectedPairingFileTitle, detectedOther: otherTitle)
+            }
             throw PairingFileImportError.invalidFileType(expected: expectedPairingFileTitle)
         }
+
+        if FileManager.default.fileExists(atPath: expectedPairingFile.path) {
+            _ = try FileManager.default.replaceItemAt(expectedPairingFile, withItemAt: tempURL)
+        } else {
+            try FileManager.default.moveItem(at: tempURL, to: expectedPairingFile)
+        }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: expectedPairingFile.path)
+
+        refreshExpectedPairingFileState()
     }
 
     private func validateExpectedPairingFile() -> Bool {
@@ -554,7 +591,16 @@ class DeviceManager: ObservableObject {
         }
         defer { rp_pairing_file_free(rpPairingHandle) }
 
-        var addr = makeSocketAddress(port: RP_PAIRING_PORT)
+        // The on-device RemoteXPC/RSD service backing this tunnel doesn't reliably bind to
+        // RP_PAIRING_PORT every session (confirmed against LocalDevVPN-based connections) —
+        // resolve its actual current port via Bonjour first, falling back to the fixed port
+        // if discovery times out.
+        let resolvedPort = RemotePairingDiscovery.resolvePort() ?? RP_PAIRING_PORT
+        if resolvedPort != RP_PAIRING_PORT {
+            self.logOnce("[DeviceManager] RPPairing service resolved to port \(resolvedPort) via Bonjour (default \(RP_PAIRING_PORT))", key: "connection_status")
+        }
+
+        var addr = makeSocketAddress(port: resolvedPort)
         let addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
         let tunnelErr = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
@@ -583,11 +629,24 @@ class DeviceManager: ObservableObject {
             return false
         }
 
-        self.logOnce("[DeviceManager] RPPairing tunnel established via \(DEVICE_HOST):\(RP_PAIRING_PORT)", key: "connection_status")
+        self.logOnce("[DeviceManager] RPPairing tunnel established via \(DEVICE_HOST):\(resolvedPort)", key: "connection_status")
         return true
     }
 
     
+    // Multiple callers can race to reconnect at once — the auto-reconnect watcher firing on
+    // its own timer, and every concurrent AFC worker independently detecting a dead transport
+    // and calling `startHeartbeat(forceReconnect: true)`, which skips all the throttling below.
+    // Each call tears down and rebuilds the *shared* provider/handshake/adapter handles via
+    // `resetConnectionHandles()`, so two overlapping attempts stomp on each other — one call's
+    // teardown can yank the transport out from under another call's in-flight handshake. This
+    // used to be a narrow window back when tunnel setup was a near-instant hardcoded-port
+    // connect; now that it includes a Bonjour lookup (up to 3s) plus a full RSD handshake, the
+    // window is wide enough that concurrent reconnects (six-way parallel AFC uploads, or the
+    // watcher's 6s "stale connecting" retrigger firing before the previous attempt even
+    // finishes) collide routinely. Coalesce: only one reconnect sequence actually runs at a
+    // time; anyone who calls in while one is in flight just waits on its result instead of
+    // starting a competing one.
     func startHeartbeat(forceReconnect: Bool = false, completion: ((Bool) -> Void)? = nil) {
         if !forceReconnect {
             if connectionStatus == "Connecting..." {
@@ -603,6 +662,29 @@ class DeviceManager: ObservableObject {
             }
         }
 
+        reconnectCoordinationLock.lock()
+        if isReconnecting {
+            if let completion {
+                pendingReconnectCompletions.append(completion)
+            }
+            reconnectCoordinationLock.unlock()
+            return
+        }
+        isReconnecting = true
+        reconnectCoordinationLock.unlock()
+
+        func finish(_ success: Bool) {
+            reconnectCoordinationLock.lock()
+            isReconnecting = false
+            let waiters = pendingReconnectCompletions
+            pendingReconnectCompletions = []
+            reconnectCoordinationLock.unlock()
+            completion?(success)
+            for waiter in waiters {
+                waiter(success)
+            }
+        }
+
         heartbeatSessionID &+= 1
         refreshExpectedPairingFileState()
         guard hasValidExpectedPairingFile else {
@@ -611,14 +693,14 @@ class DeviceManager: ObservableObject {
             DispatchQueue.main.async {
                 self.connectionStatus = message
                 self.heartbeatReady = false
-                completion?(false)
+                finish(false)
             }
             return
         }
 
         if !forceReconnect && heartbeatReady && hasActiveTransport && canStillReachDevice() {
             DispatchQueue.main.async {
-                completion?(true)
+                finish(true)
             }
             return
         }
@@ -635,38 +717,60 @@ class DeviceManager: ObservableObject {
         }
 
         resetConnectionHandles()
-        
-        
+
+
         heartbeatThread = Thread {
             let sessionID = self.heartbeatSessionID
-            self.establishHeartbeat { success in
+            let outcomeLock = NSLock()
+            var outcomeReported = false
+            let outcomeSemaphore = DispatchSemaphore(value: 0)
+
+            func reportOutcome(success: Bool) {
+                outcomeLock.lock()
+                let alreadyReported = outcomeReported
+                outcomeReported = true
+                outcomeLock.unlock()
+                guard !alreadyReported else { return }
+
                 DispatchQueue.main.async {
                     guard sessionID == self.heartbeatSessionID else { return }
-                    if success {
-                        self.connectionStatus = "Connection Lost"
-                        self.heartbeatReady = false
-                    } else {
-                        self.connectionStatus = "Connection Failed"
-                        self.heartbeatReady = false
-                    }
+                    self.connectionStatus = success ? "Connection Lost" : "Connection Failed"
+                    self.heartbeatReady = false
                 }
+            }
+
+            self.establishHeartbeat { success in
+                reportOutcome(success: success)
+                outcomeSemaphore.signal()
+            }
+
+            // `establishHeartbeat` calls into native tunnel/handshake code that only bounds the
+            // raw socket connect with a timeout — the pairing handshake, TLS-PSK negotiation, and
+            // RSD handshake that follow have none. If the VPN tunnel accepts the connection but
+            // then stalls (a stale pairing session, a half-dead tunnel silently dropping packets
+            // instead of refusing), this call can hang indefinitely and previously left the UI
+            // stuck at "Connecting..." forever — with the auto-reconnect watcher only piling more
+            // attempts on top rather than resolving anything. Bound the wait here instead: past
+            // 20s, surface a clean failure so the existing retry/backoff logic can recover. The
+            // native call itself can't be cancelled, so the underlying thread may keep running
+            // after this fires, but `reportOutcome`'s guard means its eventual result is ignored.
+            if outcomeSemaphore.wait(timeout: .now() + 20) == .timedOut {
+                Logger.shared.log("[DeviceManager] Heartbeat establishment timed out after 20s; treating as failed.")
+                reportOutcome(success: false)
             }
         }
         heartbeatThread?.name = "HeartbeatThread"
         heartbeatThread?.start()
-        
-        if let completion = completion {
-            DispatchQueue.global().async {
-                
-                for _ in 0..<20 {
-                    if self.heartbeatReady && self.hasActiveTransport {
-                        DispatchQueue.main.async { completion(true) }
-                        return
-                    }
-                    Thread.sleep(forTimeInterval: 0.5)
+
+        DispatchQueue.global().async {
+            for _ in 0..<20 {
+                if self.heartbeatReady && self.hasActiveTransport {
+                    DispatchQueue.main.async { finish(true) }
+                    return
                 }
-                DispatchQueue.main.async { completion(false) }
+                Thread.sleep(forTimeInterval: 0.5)
             }
+            DispatchQueue.main.async { finish(false) }
         }
     }
 
@@ -713,71 +817,94 @@ class DeviceManager: ObservableObject {
 
         var hbClient: HeartbeatClientHandle?
         let err = connectHeartbeatClient(&hbClient)
-        
-        if err == IdeviceSuccess && hbClient != nil {
-            self.logOnce("[DeviceManager] Heartbeat connected successfully!", key: "connection_status")
-            
-            DispatchQueue.main.async {
-                self.connectionStatus = "Connected"
-                self.heartbeatReady = true
-            }
-            
-            if requiresRPPairingTunnel {
-                while !Thread.current.isCancelled && sessionID == heartbeatSessionID {
-                    Thread.sleep(forTimeInterval: 5)
-                }
 
-                heartbeat_client_free(hbClient)
-                if sessionID == heartbeatSessionID {
-                    resetConnectionHandles()
-                    completion(true)
-                }
-                return
-            }
-            
-            
-            var consecutivePoloFailures = 0
-            while !Thread.current.isCancelled && sessionID == heartbeatSessionID {
-                var newInterval: UInt64 = 0
-                let marcoErr = heartbeat_get_marco(hbClient, 10, &newInterval)
-                if marcoErr != IdeviceSuccess {
-                    Logger.shared.log("[DeviceManager] Heartbeat marco unavailable; keeping session alive and probing with polo.")
-                }
-
-                let poloErr = heartbeat_send_polo(hbClient)
-                if poloErr != IdeviceSuccess {
-                    consecutivePoloFailures += 1
-                    Logger.shared.log("[DeviceManager] Heartbeat polo failed (\(consecutivePoloFailures)).")
-                    if consecutivePoloFailures >= 3 {
-                        Logger.shared.log("[DeviceManager] Heartbeat polo failed repeatedly. Marking connection lost.")
-                        break
-                    }
-                } else {
-                    consecutivePoloFailures = 0
-                }
-                
-                DispatchQueue.main.async {
-                    if !self.heartbeatReady {
-                         self.heartbeatReady = true
-                         self.connectionStatus = "Connected"
-                    }
-                }
-                
-                
-                Thread.sleep(forTimeInterval: 5)
-            }
-            
-            
-            heartbeat_client_free(hbClient)
-            if sessionID == heartbeatSessionID {
-                resetConnectionHandles()
-                completion(true)
-            }
-        } else {
+        guard err == IdeviceSuccess && hbClient != nil else {
             self.logOnce("[DeviceManager] ERROR: Heartbeat connection failed", key: "connection_status")
             resetConnectionHandles()
             completion(false)
+            return
         }
+
+        self.logOnce("[DeviceManager] Heartbeat connected successfully!", key: "connection_status")
+
+        DispatchQueue.main.async {
+            self.connectionStatus = "Connected"
+            self.heartbeatReady = true
+        }
+
+        runHeartbeatMonitorLoop(sessionID: sessionID, initialClient: hbClient)
+
+        if sessionID == heartbeatSessionID {
+            resetConnectionHandles()
+            completion(true)
+        }
+    }
+
+    /// Keeps the heartbeat alive for as long as the underlying transport stays usable, self-healing
+    /// through individual probe failures instead of tearing down `provider`/`rpAdapter`/`rpHandshake`
+    /// on the spot. Those handles are shared with every other service (AFC, lockdown, notification
+    /// proxy — see `connectAfcClient` etc.), so a transient heartbeat blip used to nuke the whole
+    /// transport and force a full re-pair/re-tunnel even though AFC/lockdown were fine. Now a failed
+    /// probe just tries to open a *fresh* heartbeat client on the *same* transport; only if that
+    /// also fails do we conclude the transport itself (not just one probe) is actually gone, and let
+    /// the caller reset it.
+    private func runHeartbeatMonitorLoop(sessionID: UInt64, initialClient: HeartbeatClientHandle?) {
+        var client = initialClient
+        var consecutivePoloFailures = 0
+        var marcoInterval: UInt64 = 10
+
+        while !Thread.current.isCancelled && sessionID == heartbeatSessionID {
+            var newInterval: UInt64 = 0
+            let marcoErr = heartbeat_get_marco(client, marcoInterval, &newInterval)
+
+            guard marcoErr == IdeviceSuccess else {
+                // A timed-out/missing Marco is routine — it just means the device hasn't pinged
+                // yet, not that anything is wrong. `send_polo` is only a valid *reply* to a Marco
+                // (see idevice's heartbeat.rs), so sending one anyway here would be an unsolicited,
+                // out-of-turn write the device doesn't expect — which is exactly what the old code
+                // did unconditionally, and is the most likely reason every single Marco/Polo cycle
+                // was failing outright instead of just occasionally.
+                Thread.sleep(forTimeInterval: 1)
+                continue
+            }
+
+            if newInterval > 0 {
+                marcoInterval = newInterval
+            }
+
+            let poloErr = heartbeat_send_polo(client)
+            if poloErr == IdeviceSuccess {
+                consecutivePoloFailures = 0
+                DispatchQueue.main.async {
+                    if !self.heartbeatReady {
+                        self.heartbeatReady = true
+                        self.connectionStatus = "Connected"
+                    }
+                }
+            } else {
+                consecutivePoloFailures += 1
+                Logger.shared.log("[DeviceManager] Heartbeat polo failed (\(consecutivePoloFailures)).")
+
+                if consecutivePoloFailures >= 3 {
+                    Logger.shared.log("[DeviceManager] Heartbeat unresponsive; reconnecting the heartbeat client without touching the rest of the transport.")
+                    heartbeat_client_free(client)
+
+                    var freshClient: HeartbeatClientHandle?
+                    let reconnectErr = connectHeartbeatClient(&freshClient)
+                    guard reconnectErr == IdeviceSuccess, freshClient != nil else {
+                        Logger.shared.log("[DeviceManager] Could not re-establish heartbeat on the existing transport; treating the transport as lost.")
+                        return
+                    }
+
+                    Logger.shared.log("[DeviceManager] Heartbeat client re-established; transport left untouched.")
+                    client = freshClient
+                    consecutivePoloFailures = 0
+                    marcoInterval = 10
+                }
+            }
+        }
+
+        heartbeat_client_free(client)
     }
 
     
@@ -1178,7 +1305,7 @@ class DeviceManager: ObservableObject {
             }
 
             progress?("Preparing backup...", nil)
-            let fullBackupEnabled = forceDbOnly ? false : (forceFullBackup || UserDefaults.standard.bool(forKey: "fullBackupSnapshots"))
+            let fullBackupEnabled = forceDbOnly ? false : forceFullBackup
             if self.killMusicBeforeInjectEnabled {
                 let killed = self.terminateMusicAppIfRunning()
                 Logger.shared.log("[Backup] Pre-snapshot Music kill \(killed ? "completed" : "skipped/failed")")
@@ -1300,34 +1427,15 @@ class DeviceManager: ObservableObject {
                     return
                 }
                 Logger.shared.log("[Backup] Full backup copy created: \(fullResult.message)")
+
+                progress?("Writing playlist files...", 0.97)
+                let playlistCount = self.generatePlaylistM3U8Files(in: folder)
+                Logger.shared.log("[Backup] Full backup: wrote \(playlistCount) playlist file(s)")
             }
-            
+
             progress?("Backup complete.", 1)
             Logger.shared.log("[Backup] Snapshot complete: \(folder.lastPathComponent) (\(saved.count) files)")
             completion(true, fullBackupEnabled ? "Full snapshot created: \(folder.lastPathComponent)" : "Snapshot created: \(folder.lastPathComponent)")
-        }
-    }
-
-    func exportFullLibrary(progress: SnapshotProgressHandler? = nil, completion: @escaping (Bool, String, URL?) -> Void) {
-        createDatabaseSnapshot(forceDbOnly: false, forceFullBackup: true, progress: progress) { success, message in
-            guard success else {
-                completion(false, message, nil)
-                return
-            }
-
-            self.fetchDatabaseSnapshots { list in
-                guard let latest = list.first else {
-                    completion(false, "Backup created but could not be located", nil)
-                    return
-                }
-
-                self.withSnapshotsDirectoryAccess {
-                    let folderURL = self.snapshotsDirectoryURL.appendingPathComponent(latest.folderName, isDirectory: true)
-                    let playlistCount = self.generatePlaylistM3U8Files(in: folderURL)
-                    Logger.shared.log("[Backup] Export Full Library: wrote \(playlistCount) playlist file(s)")
-                    completion(true, "Full library ready to export", folderURL)
-                }
-            }
         }
     }
 
@@ -2470,6 +2578,8 @@ class DeviceManager: ObservableObject {
         let title: String
         let artist: String
         let album: String
+        let albumPid: Int64
+        let albumArtist: String
         let genre: String
         let year: Int
         let durationMs: Int
@@ -2541,6 +2651,8 @@ class DeviceManager: ObservableObject {
             ie.title,
             IFNULL(ia.item_artist, ''),
             IFNULL(al.album, ''),
+            i.album_pid,
+            IFNULL(aa.album_artist, ''),
             IFNULL(ge.genre, ''),
             ie.year,
             CAST(ie.total_time_ms AS INTEGER),
@@ -2551,6 +2663,7 @@ class DeviceManager: ObservableObject {
         JOIN item_extra ie ON ie.item_pid = i.item_pid
         LEFT JOIN item_artist ia ON ia.item_artist_pid = i.item_artist_pid
         LEFT JOIN album al ON al.album_pid = i.album_pid
+        LEFT JOIN album_artist aa ON aa.album_artist_pid = al.album_artist_pid
         LEFT JOIN genre ge ON ge.genre_id = i.genre_id
         WHERE ie.location != ''
         """
@@ -2574,24 +2687,28 @@ class DeviceManager: ObservableObject {
             let title = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
             let artist = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "Unknown Artist"
             let album = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "Unknown Album"
-            let genre = sqlite3_column_text(stmt, 5).map { String(cString: $0) } ?? "Music"
-            let year = Int(sqlite3_column_int(stmt, 6))
-            let durationMs = Int(sqlite3_column_int(stmt, 7))
-            let fileSize = Int(sqlite3_column_int(stmt, 8))
-            let trackNumber = Int(sqlite3_column_int(stmt, 9))
-            let explicitRating = Int(sqlite3_column_int(stmt, 10))
+            let albumPid = sqlite3_column_int64(stmt, 5)
+            let albumArtist = sqlite3_column_text(stmt, 6).map { String(cString: $0) } ?? ""
+            let genre = sqlite3_column_text(stmt, 7).map { String(cString: $0) } ?? "Music"
+            let year = Int(sqlite3_column_int(stmt, 8))
+            let durationMs = Int(sqlite3_column_int(stmt, 9))
+            let fileSize = Int(sqlite3_column_int(stmt, 10))
+            let trackNumber = Int(sqlite3_column_int(stmt, 11))
+            let explicitRating = Int(sqlite3_column_int(stmt, 12))
             let lyrics = firstStringQuery(
                 db: db,
                 sql: "SELECT lyrics FROM lyrics WHERE item_pid = ? LIMIT 1",
                 itemPid: itemPid
             )
             let artworkRelativePath = artworkPathForItemPid(db: db, itemPid: itemPid)
-            
+
             map[filename] = CarrySongDBMetadata(
                 itemPid: itemPid,
                 title: title.isEmpty ? URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent : title,
                 artist: artist.isEmpty ? "Unknown Artist" : artist,
                 album: album.isEmpty ? "Unknown Album" : album,
+                albumPid: albumPid,
+                albumArtist: albumArtist.isEmpty ? (artist.isEmpty ? "Unknown Artist" : artist) : albumArtist,
                 genre: genre.isEmpty ? "Music" : genre,
                 year: year > 0 ? year : Calendar.current.component(.year, from: Date()),
                 durationMs: max(0, durationMs),
@@ -3050,7 +3167,9 @@ class DeviceManager: ObservableObject {
             semFiles.wait()
 
             let metadataMap = self.carrySongMetadataMapFromDatabase(stagedDbURL)
-            let songs = self.musicFilenamesFromDatabase(stagedDbURL)
+            let dbFilenames = self.musicFilenamesFromDatabase(stagedDbURL)
+            Logger.shared.log("[Export] DB lists \(dbFilenames.count) song filename(s); on-device listing at \(musicDir) returned \(onDeviceFiles.count) file(s)")
+            let songs = dbFilenames
                 .filter { onDeviceFiles.contains($0) }
                 .map { filename -> ExportableSongInfo in
                     let meta = metadataMap[filename]
@@ -3061,6 +3180,8 @@ class DeviceManager: ObservableObject {
                         title: meta?.title ?? fallbackTitle,
                         artist: meta?.artist ?? "Unknown Artist",
                         album: meta?.album ?? "Unknown Album",
+                        albumPid: meta?.albumPid ?? 0,
+                        albumArtist: meta?.albumArtist ?? (meta?.artist ?? "Unknown Artist"),
                         genre: meta?.genre ?? "Music",
                         year: meta?.year ?? 0,
                         durationMs: meta?.durationMs ?? 0,
@@ -3083,7 +3204,21 @@ class DeviceManager: ObservableObject {
             completion(songs)
         }
     }
-    
+
+    func downloadSongFileForAnalysis(_ song: ExportableSongInfo, completion: @escaping (Data?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureActiveTransport(reason: "analyzing this song's audio quality") else {
+                completion(nil)
+                return
+            }
+            let musicDir = self.resolvePrimaryMusicDirectory()
+            let remotePath = "\(musicDir)/\(song.remoteFilename)"
+            self.downloadFileFromDevice(remotePath: remotePath) { data in
+                completion(data)
+            }
+        }
+    }
+
     func fetchExportablePlaylists(completion: @escaping ([(name: String, pid: Int64, songPids: [Int64])]) -> Void) {
         let semDb = DispatchSemaphore(value: 0)
         var dbData: Data?
@@ -3461,7 +3596,294 @@ class DeviceManager: ObservableObject {
             completion(true, "Updated metadata for \(safeTitle).")
         }
     }
-    
+
+    func replaceExportableSongAudioFile(
+        original: ExportableSongInfo,
+        newLocalURL: URL,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureActiveTransport(reason: "replacing this song's audio file") else {
+                completion(false, "Device connection unavailable.")
+                return
+            }
+
+            let metadataSem = DispatchSemaphore(value: 0)
+            var newMetadata: SongMetadata?
+            Task {
+                newMetadata = try? await SongMetadata.fromURL(newLocalURL, includeArtwork: false)
+                metadataSem.signal()
+            }
+            metadataSem.wait()
+
+            guard let newMetadata, newMetadata.durationMs > 0 else {
+                completion(false, "Could not read that file as audio.")
+                return
+            }
+
+            let killed = self.terminateMusicAppIfRunning()
+            Logger.shared.log("[SyncLifecycle] Music pre-kill \(killed ? "completed" : "skipped/failed") for replace_audio")
+
+            guard let context = self.stageCurrentMediaLibraryForMutation(label: "replace_audio") else {
+                completion(false, "Could not stage MediaLibrary.sqlitedb.")
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: context.tempDir) }
+
+            var db: OpaquePointer?
+            guard sqlite3_open(context.dbURL.path, &db) == SQLITE_OK else {
+                if db != nil { sqlite3_close(db) }
+                completion(false, "Could not open MediaLibrary.sqlitedb.")
+                return
+            }
+
+            let itemPid = original.itemPid > 0 ? original.itemPid : (self.itemPid(forRemoteFilename: original.remoteFilename, db: db) ?? 0)
+            guard itemPid > 0 else {
+                sqlite3_close(db)
+                completion(false, "Could not find that song in MediaLibrary.sqlitedb.")
+                return
+            }
+
+            let newRemoteFilename = SongMetadata.generateRemoteFilename(withExtension: newLocalURL.pathExtension)
+
+            var afc: AfcClientHandle?
+            self.connectAfcClient(&afc)
+            guard let afcHandle = afc else {
+                sqlite3_close(db)
+                completion(false, "Could not open device file transfer session.")
+                return
+            }
+
+            let uploaded = self.uploadFileToDevice(
+                localURL: newLocalURL,
+                remotePath: "\(context.musicDir)/\(newRemoteFilename)",
+                afc: afcHandle,
+                verify: true
+            )
+            afc_client_free(afcHandle)
+
+            guard uploaded else {
+                sqlite3_close(db)
+                completion(false, "Failed to upload the replacement audio file.")
+                return
+            }
+
+            _ = self.sqliteExec(db, "BEGIN IMMEDIATE TRANSACTION")
+            let escapedLocation = self.escapeSQLString(newRemoteFilename)
+            let success = [
+                """
+                UPDATE item_extra
+                SET total_time_ms = \(newMetadata.durationMs),
+                    file_size = \(newMetadata.fileSize),
+                    location = '\(escapedLocation)',
+                    date_modified = \(Int(Date().timeIntervalSince1970))
+                WHERE item_pid = \(itemPid)
+                """,
+                """
+                UPDATE item_playback
+                SET audio_format = \(newMetadata.playbackAudioFormat),
+                    bit_rate = \(newMetadata.playbackBitRate),
+                    codec_type = \(newMetadata.playbackCodecType),
+                    codec_subtype = \(newMetadata.playbackCodecSubtype),
+                    sample_rate = \(newMetadata.playbackSampleRate)
+                WHERE item_pid = \(itemPid)
+                """
+            ].allSatisfy { self.sqliteExec(db, $0) }
+
+            _ = self.sqliteExec(db, success ? "COMMIT" : "ROLLBACK")
+            _ = self.sqliteExec(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+            _ = self.sqliteExec(db, "PRAGMA journal_mode=DELETE")
+            sqlite3_close(db)
+
+            guard success else {
+                completion(false, "Could not update MediaLibrary.sqlitedb.")
+                return
+            }
+
+            guard self.commitStagedMediaLibrary(localDbURL: context.dbURL) else {
+                completion(false, "Failed to upload the updated device library.")
+                return
+            }
+
+            let oldPath = "\(context.musicDir)/\(original.remoteFilename)"
+            let removeSem = DispatchSemaphore(value: 0)
+            self.removeFileFromDevice(remotePath: oldPath) { _ in removeSem.signal() }
+            removeSem.wait()
+
+            completion(true, "Replaced the audio file for \(original.title).")
+        }
+    }
+
+    func updateExportableSongsMetadata(
+        originals: [ExportableSongInfo],
+        artist: String,
+        album: String,
+        genre: String,
+        year: Int,
+        artworkData: Data?,
+        explicitRating: Int?,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        guard !originals.isEmpty else {
+            completion(false, "No songs to update.")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureActiveTransport(reason: "editing album metadata on the device") else {
+                completion(false, "Device connection unavailable.")
+                return
+            }
+
+            let killed = self.terminateMusicAppIfRunning()
+            Logger.shared.log("[SyncLifecycle] Music pre-kill \(killed ? "completed" : "skipped/failed")")
+
+            guard let context = self.stageCurrentMediaLibraryForMutation(label: "edit_album") else {
+                completion(false, "Could not stage MediaLibrary.sqlitedb.")
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: context.tempDir) }
+
+            var db: OpaquePointer?
+            guard sqlite3_open(context.dbURL.path, &db) == SQLITE_OK else {
+                if db != nil { sqlite3_close(db) }
+                completion(false, "Could not open MediaLibrary.sqlitedb.")
+                return
+            }
+
+            let safeArtist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeAlbum = album.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeGenre = genre.trimmingCharacters(in: .whitespacesAndNewlines)
+            let escapedArtist = self.escapeSQLString(safeArtist)
+            let escapedAlbum = self.escapeSQLString(safeAlbum)
+            let escapedGenre = self.escapeSQLString(safeGenre)
+            let safeYear = max(0, year)
+
+            _ = self.sqliteExec(db, "BEGIN IMMEDIATE TRANSACTION")
+
+            var success = true
+            for original in originals {
+                let itemPid = original.itemPid > 0 ? original.itemPid : (self.itemPid(forRemoteFilename: original.remoteFilename, db: db) ?? 0)
+                guard itemPid > 0 else {
+                    success = false
+                    break
+                }
+
+                let newArtistPid = self.ensureNamedArtist(
+                    db: db,
+                    tableName: "item_artist",
+                    idColumn: "item_artist_pid",
+                    nameColumn: "item_artist",
+                    sortColumn: "sort_item_artist",
+                    name: safeArtist.isEmpty ? original.artist : safeArtist,
+                    representativeItemPid: itemPid
+                )
+                let newAlbumArtistPid = self.ensureNamedArtist(
+                    db: db,
+                    tableName: "album_artist",
+                    idColumn: "album_artist_pid",
+                    nameColumn: "album_artist",
+                    sortColumn: "sort_album_artist",
+                    name: safeArtist.isEmpty ? original.artist : safeArtist,
+                    representativeItemPid: itemPid
+                )
+                let newAlbumPid = self.ensureAlbum(
+                    db: db,
+                    name: safeAlbum.isEmpty ? original.album : safeAlbum,
+                    albumArtistPid: newAlbumArtistPid,
+                    representativeItemPid: itemPid,
+                    year: safeYear > 0 ? safeYear : original.year
+                )
+                let newGenreId = self.ensureGenre(
+                    db: db,
+                    name: safeGenre.isEmpty ? original.genre : safeGenre,
+                    representativeItemPid: itemPid
+                )
+
+                let trackNumber = max(0, original.trackNumber ?? 0)
+                let itemYear = safeYear > 0 ? safeYear : original.year
+                let itemExplicitRating = max(0, explicitRating ?? original.explicitRating)
+
+                let statements = [
+                    """
+                    UPDATE item
+                    SET item_artist_pid = \(newArtistPid),
+                        album_pid = \(newAlbumPid),
+                        album_artist_pid = \(newAlbumArtistPid),
+                        genre_id = \(newGenreId),
+                        track_number = \(trackNumber)
+                    WHERE item_pid = \(itemPid)
+                    """,
+                    """
+                    UPDATE item_extra
+                    SET year = \(itemYear),
+                        content_rating = \(itemExplicitRating)
+                    WHERE item_pid = \(itemPid)
+                    """,
+                    """
+                    UPDATE album
+                    SET album = '\(escapedAlbum.isEmpty ? self.escapeSQLString(original.album) : escapedAlbum)',
+                        sort_album = '\(escapedAlbum.isEmpty ? self.escapeSQLString(original.album) : escapedAlbum)',
+                        album_year = CASE WHEN \(itemYear) > 0 THEN \(itemYear) ELSE album_year END
+                    WHERE album_pid = \(newAlbumPid)
+                    """,
+                    """
+                    UPDATE item_artist
+                    SET item_artist = '\(escapedArtist.isEmpty ? self.escapeSQLString(original.artist) : escapedArtist)',
+                        sort_item_artist = '\(escapedArtist.isEmpty ? self.escapeSQLString(original.artist) : escapedArtist)'
+                    WHERE item_artist_pid = \(newArtistPid)
+                    """,
+                    """
+                    UPDATE album_artist
+                    SET album_artist = '\(escapedArtist.isEmpty ? self.escapeSQLString(original.artist) : escapedArtist)',
+                        sort_album_artist = '\(escapedArtist.isEmpty ? self.escapeSQLString(original.artist) : escapedArtist)'
+                    WHERE album_artist_pid = \(newAlbumArtistPid)
+                    """,
+                    """
+                    UPDATE genre
+                    SET genre = '\(escapedGenre.isEmpty ? self.escapeSQLString(original.genre) : escapedGenre)'
+                    WHERE genre_id = \(newGenreId)
+                    """
+                ]
+
+                if !statements.allSatisfy({ self.sqliteExec(db, $0) }) {
+                    success = false
+                    break
+                }
+            }
+
+            _ = self.sqliteExec(db, success ? "COMMIT" : "ROLLBACK")
+            _ = self.sqliteExec(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+            _ = self.sqliteExec(db, "PRAGMA journal_mode=DELETE")
+            sqlite3_close(db)
+
+            guard success else {
+                completion(false, "Could not update MediaLibrary.sqlitedb.")
+                return
+            }
+
+            if let artworkData, !artworkData.isEmpty {
+                var afc: AfcClientHandle?
+                self.connectAfcClient(&afc)
+                if let afc {
+                    for original in originals {
+                        guard let relativePath = original.artworkRelativePath, !relativePath.isEmpty else { continue }
+                        let remoteArtworkPath = "/iTunes_Control/iTunes/Artwork/Originals/\(relativePath)"
+                        _ = self.uploadDataToDevice(artworkData, remotePath: remoteArtworkPath, afc: afc, verify: false)
+                    }
+                    afc_client_free(afc)
+                }
+            }
+
+            guard self.commitStagedMediaLibrary(localDbURL: context.dbURL) else {
+                completion(false, "Failed to upload the updated device library.")
+                return
+            }
+
+            completion(true, "Updated metadata for \(originals.count) song\(originals.count == 1 ? "" : "s").")
+        }
+    }
+
     private func resolvePrimaryMusicDirectory() -> String {
         let fallback = "/iTunes_Control/Music/F00"
         var dbData: Data?
@@ -3515,7 +3937,7 @@ class DeviceManager: ObservableObject {
             }
 
             let rawPath = String(cString: pathPtr)
-            let normalized = rawPath.hasPrefix("/") ? rawPath : "/\(rawPath)"
+            let normalized = self.normalizeITunesControlPath(rawPath)
             return normalized.hasPrefix("/iTunes_Control/Music/") ? normalized : nil
         }
 
@@ -3526,6 +3948,18 @@ class DeviceManager: ObservableObject {
 
         Logger.shared.log("[DeviceManager] Music dir resolve: fallback to \(fallback) (base_location missing/invalid)")
         return fallback
+    }
+
+    /// `base_location.path` values in MediaLibrary.sqlitedb are sometimes stored relative to
+    /// `/iTunes_Control` (e.g. `"Music/F00"`) rather than as full absolute paths — normalizes
+    /// either form to a proper absolute `/iTunes_Control/...` path.
+    private func normalizeITunesControlPath(_ raw: String) -> String {
+        var path = raw
+        if !path.hasPrefix("/") { path = "/" + path }
+        if path == "/iTunes_Control" || path.hasPrefix("/iTunes_Control/") {
+            return path
+        }
+        return "/iTunes_Control" + path
     }
 
     private func withStagedMediaLibrary<T>(
@@ -4309,28 +4743,7 @@ class DeviceManager: ObservableObject {
 
     private func storefrontIDForCurrentRegion() -> Int64 {
         let region = UserDefaults.standard.string(forKey: "storeRegion")?.lowercased() ?? "us"
-        let storefrontMap: [String: Int64] = [
-            "us": 143441, "gb": 143444, "ca": 143455, "au": 143460,
-            "de": 143443, "fr": 143442, "jp": 143462, "mx": 143468,
-            "es": 143454, "it": 143450, "br": 143503, "kr": 143466,
-            "cn": 143465, "in": 143467, "ru": 143469, "se": 143456,
-            "nl": 143452, "no": 143457, "dk": 143458, "fi": 143447,
-            "at": 143445, "ch": 143459, "be": 143446, "ie": 143449,
-            "nz": 143461, "sg": 143464, "hk": 143463, "tw": 143470,
-            "ar": 143505, "cl": 143483, "co": 143501, "pe": 143507,
-            "ve": 143502, "ec": 143509, "cr": 143495, "pa": 143485,
-            "do": 143508, "gt": 143504, "hn": 143510, "sv": 143506,
-            "py": 143513, "uy": 143514, "bo": 143516, "ni": 143512,
-            "pr": 143522, "ph": 143474, "th": 143475, "my": 143473,
-            "id": 143476, "vn": 143471, "pk": 143477, "eg": 143516,
-            "sa": 143479, "ae": 143481, "il": 143491, "za": 143472,
-            "ng": 143561, "ke": 143529, "pt": 143453, "pl": 143478,
-            "tr": 143480, "ua": 143492, "ro": 143487, "hu": 143482,
-            "cz": 143489, "gr": 143448, "sk": 143496, "bg": 143526,
-            "hr": 143494, "lt": 143520, "lv": 143519, "ee": 143518,
-            "si": 143499, "lu": 143451, "mt": 143521
-        ]
-        return storefrontMap[region] ?? 143441
+        return SongMetadata.storefrontMap[region] ?? 143441
     }
 
     private func applyExperimentalAppleMetadataRepairs(
@@ -5205,6 +5618,86 @@ class DeviceManager: ObservableObject {
     
     
     
+    enum DirectoryListResult {
+        case files([String])
+        /// The directory itself doesn't exist on the device (AFC ObjectNotFound) — a
+        /// definitive signal, not a transient failure, so callers can safely conclude
+        /// anything expected inside it is genuinely gone.
+        case confirmedMissing
+        /// Couldn't determine either way (connection issue, unexpected error, etc.) — treat
+        /// as unknown, not as evidence of absence.
+        case unknown
+    }
+
+    /// Same as `listFiles`, but distinguishes "directory confirmed absent" from "couldn't
+    /// check" instead of collapsing both into `nil` — needed by callers (like the stale
+    /// downloaded-status repair) where treating an unknown failure as "missing" would produce
+    /// false positives.
+    func listFilesOrConfirmMissing(remotePath: String, completion: @escaping (DirectoryListResult) -> Void) {
+        Logger.shared.log("[DeviceManager] listFilesOrConfirmMissing called for: \(remotePath)")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var afc: AfcClientHandle?
+            self.connectAfcClient(&afc)
+
+            guard afc != nil else {
+                Logger.shared.log("[DeviceManager] ERROR: AFC client is nil for listFilesOrConfirmMissing")
+                completion(.unknown)
+                return
+            }
+
+            defer {
+                if let currentAfc = afc {
+                    afc_client_free(currentAfc)
+                }
+            }
+
+            for attempt in 1...2 {
+                var entries: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+                var count: Int = 0
+
+                let err = afc_list_directory(afc, remotePath, &entries, &count)
+
+                if err == nil {
+                    var files: [String] = []
+                    if let list = entries {
+                        for i in 0..<count {
+                            if let ptr = list[i] {
+                                let name = String(cString: ptr)
+                                if name != "." && name != ".." {
+                                    files.append(name)
+                                }
+                            }
+                        }
+                        free(entries)
+                    }
+                    completion(.files(files))
+                    return
+                }
+
+                if let listErr = err {
+                    let msg = listErr.pointee.message != nil ? String(cString: listErr.pointee.message!) : "No message"
+                    let isConnLoss = self.isConnectionLossError(listErr)
+                    let isObjectNotFound = msg.contains("ObjectNotFound")
+                    Logger.shared.log("[DeviceManager] afc_list_directory failed. Code: \(listErr.pointee.code), Msg: \(msg), ConnectionLoss: \(isConnLoss)")
+                    idevice_error_free(listErr)
+
+                    if isConnLoss && attempt < 2 {
+                        if self.reconnectAfcClient(&afc, reason: remotePath) {
+                            continue
+                        }
+                    }
+
+                    completion(isObjectNotFound ? .confirmedMissing : .unknown)
+                    return
+                }
+
+                completion(.unknown)
+                return
+            }
+        }
+    }
+
     func listFiles(remotePath: String, completion: @escaping ([String]?) -> Void) {
         Logger.shared.log("[DeviceManager] listFiles called for: \(remotePath)")
         
@@ -5328,16 +5821,26 @@ class DeviceManager: ObservableObject {
             
             Logger.shared.log("[DeviceManager] Step 0: Listing existing files in \(musicDir)")
             var onDeviceFiles: Set<String> = []
+            var listResult: DirectoryListResult = .unknown
             let semFiles = DispatchSemaphore(value: 0)
-            
-            self.listFiles(remotePath: musicDir) { files in
-                if let f = files {
-                    onDeviceFiles = Set(f)
-                }
+
+            self.listFilesOrConfirmMissing(remotePath: musicDir) { result in
+                listResult = result
                 semFiles.signal()
             }
             guard self.awaitAFCOperation(semFiles, timeoutSeconds: 60, step: "Listing device files") else {
                 progress("Error: Device connection stalled. Try again.")
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            switch listResult {
+            case .files(let files):
+                onDeviceFiles = Set(files)
+            case .confirmedMissing:
+                onDeviceFiles = []
+            case .unknown:
+                Logger.shared.log("[DeviceManager] Could not confirm on-device file listing for \(musicDir) — aborting sync to avoid treating unknown as empty and wiping the library.")
+                progress("Error: Could not verify device library. Try again.")
                 DispatchQueue.main.async { completion(false) }
                 return
             }
@@ -5678,16 +6181,26 @@ class DeviceManager: ObservableObject {
             
             Logger.shared.log("[DeviceManager] Step 0: Listing existing files in \(musicDir)")
             var onDeviceFiles: Set<String> = []
+            var listResult: DirectoryListResult = .unknown
             let semFiles = DispatchSemaphore(value: 0)
-            
-            self.listFiles(remotePath: musicDir) { files in
-                if let f = files {
-                    onDeviceFiles = Set(f)
-                }
+
+            self.listFilesOrConfirmMissing(remotePath: musicDir) { result in
+                listResult = result
                 semFiles.signal()
             }
             guard self.awaitAFCOperation(semFiles, timeoutSeconds: 60, step: "Listing device files (playlist)") else {
                 progress("Error: Device connection stalled. Try again.")
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            switch listResult {
+            case .files(let files):
+                onDeviceFiles = Set(files)
+            case .confirmedMissing:
+                onDeviceFiles = []
+            case .unknown:
+                Logger.shared.log("[DeviceManager] Could not confirm on-device file listing for \(musicDir) — aborting sync to avoid treating unknown as empty and wiping the library.")
+                progress("Error: Could not verify device library. Try again.")
                 DispatchQueue.main.async { completion(false) }
                 return
             }

@@ -4,10 +4,10 @@ import UIKit
 struct LogViewer: View {
     @ObservedObject var logger = Logger.shared
     @Environment(\.presentationMode) var presentationMode
-    
+
     @State private var shareItem: SharedLogFile?
     @State private var showCopiedBanner = false
-    
+
     var body: some View {
         NavigationView {
             ScrollViewReader { proxy in
@@ -30,7 +30,7 @@ struct LogViewer: View {
                         logger.clear()
                     }
                 }
-                
+
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         presentationMode.wrappedValue.dismiss()

@@ -5,11 +5,11 @@ struct SettingsView: View {
     @Environment(\.openURL) private var openURL
     @ObservedObject var manager: DeviceManager
     @Binding var status: String
-    
+
     @State private var showingPairingPicker = false
     @State private var showingDownloadFolderPicker = false
     @State private var showingDeleteAlert = false
-    
+
     @State private var showingLogViewer = false
     @State private var exportedDbURLs: [URL] = []
     @State private var showingDbExportSheet = false
@@ -18,13 +18,14 @@ struct SettingsView: View {
     @State private var settingsUpdate: AppUpdateInfo?
     @State private var supporters: [String] = []
     @State private var supportersLoaded = false
-    
+
     @State private var showToast = false
     @State private var toastTitle = ""
     @State private var toastIcon = ""
 
     @AppStorage("metadataSource") private var metadataSource = "local"
     @AppStorage("autofetchMetadata") private var autofetchMetadata = true
+    @AppStorage("keepLocalMetadataForLocalFiles") private var keepLocalMetadataForLocalFiles = false
     @AppStorage("fetchLyrics") private var fetchLyrics = false
     @AppStorage("appleSubscriptionLyrics") private var appleSubscriptionLyrics = false
     @AppStorage("storeRegion") private var storeRegion = "US"
@@ -33,14 +34,9 @@ struct SettingsView: View {
     @AppStorage("backgroundDownloadsEnabled") private var backgroundDownloadsEnabled = false
     @AppStorage("backgroundMetadataFetchEnabled") private var backgroundMetadataFetchEnabled = true
     @AppStorage("downloadLiveActivitiesEnabled") private var downloadLiveActivitiesEnabled = true
-    @AppStorage("fullBackupSnapshots") private var fullBackupSnapshots = false
-    @AppStorage("downloadServer") private var downloadServer = DownloaderServerPreference.byeTunesAPI.rawValue
     @AppStorage("downloadSearchProvider") private var downloadSearchProvider = DownloadSearchProviderOption.appleMusic.rawValue
-    @AppStorage("autoDownloadTier") private var autoDownloadTier = "high"
     @AppStorage("yoinkifyFormat") private var yoinkifyFormat = "flac"
-    @AppStorage("qobuzFallbackQuality") private var qobuzFallbackQuality = "27"
-    @AppStorage("tidalFallbackQuality") private var tidalFallbackQuality = "LOSSLESS"
-    
+
     var body: some View {
         NavigationStack {
         ZStack(alignment: .bottom) {
@@ -52,21 +48,20 @@ struct SettingsView: View {
             GeometryReader { proxy in
                 ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 24) {
-                
+
                 Text("Settings")
                     .font(.system(size: 34, weight: .bold))
                     .padding(.top, 8)
-                
-                
+
                 VStack(alignment: .leading, spacing: 12) {
                     Text("CONNECTION")
                         .font(.caption)
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .tracking(0.5)
-                    
+
                     VStack(spacing: 0) {
-                        
+
                         Button {
                             showingPairingPicker = true
                         } label: {
@@ -75,7 +70,7 @@ struct SettingsView: View {
                                     .font(.body)
                                     .foregroundColor(.primary)
                                     .frame(width: 28)
-                                
+
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(manager.expectedPairingFileTitle)
                                         .font(.body)
@@ -84,9 +79,9 @@ struct SettingsView: View {
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
-                                
+
                                 Spacer()
-                                
+
                                 Image(systemName: "chevron.right")
                                     .font(.caption)
                                     .foregroundColor(Color(.systemGray3))
@@ -94,21 +89,20 @@ struct SettingsView: View {
                             .padding(.vertical, 14)
                             .padding(.horizontal, 16)
                         }
-                        
+
                         Divider().padding(.leading, 56)
-                        
-                        
+
                         HStack {
                             Image(systemName: "antenna.radiowaves.left.and.right")
                                 .font(.body)
                                 .foregroundColor(.primary)
                                 .frame(width: 28)
-                            
+
                             Text("Status")
                                 .font(.body)
-                            
+
                             Spacer()
-                            
+
                             HStack(spacing: 6) {
                                 Circle()
                                     .fill(manager.heartbeatReady ? Color.green : Color.red)
@@ -116,7 +110,7 @@ struct SettingsView: View {
                                 Text(manager.connectionStatus)
                                     .font(.subheadline)
                                     .foregroundColor(.secondary)
-                                
+
                                 Button {
                                     manager.startHeartbeat(forceReconnect: true)
                                 } label: {
@@ -143,105 +137,7 @@ struct SettingsView: View {
                             .stroke(Color(.systemGray5), lineWidth: 1)
                     )
                 }
-                
-                
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("ABOUT")
-                        .font(.caption)
-                        .fontWeight(.medium)
-                        .foregroundColor(.secondary)
-                        .tracking(0.5)
-                    
-                    VStack(spacing: 0) {
-                        Button {
-                            if let settingsUpdate {
-                                openURL(settingsUpdate.releaseURL)
-                            } else {
-                                checkForSettingsUpdate()
-                            }
-                        } label: {
-                            HStack {
-                                Image(systemName: "info.circle")
-                                    .font(.body)
-                                    .foregroundColor(.primary)
-                                    .frame(width: 28)
-                                
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Version")
-                                        .font(.body)
-                                        .foregroundColor(.primary)
 
-                                    Text(settingsUpdate == nil ? "Tap to check for updates" : "Tap to download the latest release")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                
-                                Spacer()
-                                
-                                if isCheckingForUpdate {
-                                    ProgressView()
-                                } else {
-                                    Text(settingsUpdate.map { "Update \($0.version)" } ?? AppUpdateChecker.currentVersion)
-                                        .font(.subheadline)
-                                        .foregroundColor(settingsUpdate == nil ? .secondary : .accentColor)
-                                }
-                            }
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                        .disabled(isCheckingForUpdate)
-                        
-                        Divider().padding(.leading, 56)
-                        
-                        HStack {
-                            Image(systemName: "music.note")
-                                .font(.body)
-                                .foregroundColor(.primary)
-                                .frame(width: 28)
-                            
-                            Text("Music Formats")
-                                .font(.body)
-                            
-                            Spacer()
-                            
-                            Text("MP3, FLAC, M4A, WAV, Opus")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                        
-                        Divider().padding(.leading, 56)
-                        
-                        HStack {
-                            Image(systemName: "bell.badge")
-                                .font(.body)
-                                .foregroundColor(.primary)
-                                .frame(width: 28)
-                            
-                            Text("Ringtone Formats")
-                                .font(.body)
-                            
-                            Spacer()
-                            
-                            Text("M4R, MP3 (Ringtones injection disabled for now")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                    }
-                    .background(Color(.systemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color(.systemGray5), lineWidth: 1)
-                    )
-                }
-                
-                
-                
-                
                 VStack(alignment: .leading, spacing: 12) {
                     Text("LIBRARY REPAIR & MAINTENANCE")
                         .font(.caption)
@@ -286,7 +182,6 @@ struct SettingsView: View {
                     )
                 }
 
-
                 VStack(alignment: .leading, spacing: 12) {
                     Text("DOWNLOADS")
                         .font(.caption)
@@ -299,21 +194,18 @@ struct SettingsView: View {
                             DownloaderSettingsScreen(
                                 metadataSource: $metadataSource,
                                 autofetchMetadata: $autofetchMetadata,
+                                keepLocalMetadataForLocalFiles: $keepLocalMetadataForLocalFiles,
                                 fetchLyrics: $fetchLyrics,
                                 appleSubscriptionLyrics: $appleSubscriptionLyrics,
                                 storeRegion: $storeRegion,
                                 appleRichMetadata: $appleRichMetadata,
-                                downloadServer: $downloadServer,
                                 downloadSearchProvider: $downloadSearchProvider,
                                 keepDownloadedSongs: $keepDownloadedSongs,
                                 backgroundDownloadsEnabled: $backgroundDownloadsEnabled,
                                 backgroundMetadataFetchEnabled: $backgroundMetadataFetchEnabled,
                                 downloadLiveActivitiesEnabled: $downloadLiveActivitiesEnabled,
                                 showingDownloadFolderPicker: $showingDownloadFolderPicker,
-                                autoDownloadTier: $autoDownloadTier,
                                 yoinkifyFormat: $yoinkifyFormat,
-                                qobuzFallbackQuality: $qobuzFallbackQuality,
-                                tidalFallbackQuality: $tidalFallbackQuality,
                                 downloadFolderSubtitle: downloadFolderSubtitle
                             )
                         } label: {
@@ -446,7 +338,7 @@ struct SettingsView: View {
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .tracking(0.5)
-                    
+
                     VStack(spacing: 0) {
                         Link(destination: URL(string: "https://www.icloud.com/shortcuts/49de36f87bf44b21a38056d3c33e41fe")!) {
                             HStack {
@@ -454,13 +346,13 @@ struct SettingsView: View {
                                     .font(.body)
                                     .foregroundColor(.purple)
                                     .frame(width: 28)
-                                
+
                                 Text("Add ByeTunes Shortcut")
                                     .font(.body)
                                     .foregroundColor(.primary)
-                                
+
                                 Spacer()
-                                
+
                                 Image(systemName: "arrow.up.right")
                                     .font(.caption)
                                     .foregroundColor(Color(.systemGray3))
@@ -476,15 +368,14 @@ struct SettingsView: View {
                             .stroke(Color(.systemGray5), lineWidth: 1)
                     )
                 }
-                
-                
+
                 VStack(alignment: .leading, spacing: 12) {
                     Text("HELP & SUPPORT")
                         .font(.caption)
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .tracking(0.5)
-                    
+
                     VStack(spacing: 0) {
                         DisclosureGroup {
                             VStack(alignment: .leading, spacing: 10) {
@@ -507,9 +398,9 @@ struct SettingsView: View {
                             }
                         }
                         .padding()
-                        
+
                         Divider().padding(.leading)
-                        
+
                         DisclosureGroup {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text("• App Stuck on White/Black Screen?")
@@ -550,9 +441,9 @@ struct SettingsView: View {
                             }
                         }
                         .padding()
-                        
+
                         Divider().padding(.leading)
-                        
+
                         DisclosureGroup {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text("• What is Auto-Inject?")
@@ -576,7 +467,6 @@ struct SettingsView: View {
                         }
                         .padding()
 
-
                     }
                     .background(Color(.systemBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -585,90 +475,6 @@ struct SettingsView: View {
                             .stroke(Color(.systemGray5), lineWidth: 1)
                     )
                 }
-                
-                
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("CREDITS")
-                        .font(.caption)
-                        .fontWeight(.medium)
-                        .foregroundColor(.secondary)
-                        .tracking(0.5)
-                    
-                    VStack(spacing: 0) {
-                        HStack(spacing: 12) {
-                            Image(systemName: "person.crop.circle.fill")
-                                .font(.system(size: 18))
-                                .foregroundColor(.blue)
-                                .frame(width: 28)
-                            
-                            Link("EduAlexxis", destination: URL(string: "https://github.com/EduAlexxis")!)
-                                .font(.body.weight(.medium))
-                                .foregroundColor(.primary)
-                            
-                            Spacer()
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                        
-                        Divider().padding(.leading, 56)
-                        
-                        HStack(spacing: 12) {
-                            Image(systemName: "person.crop.circle.fill")
-                                .font(.system(size: 18))
-                                .foregroundColor(.indigo)
-                                .frame(width: 28)
-                            
-                            Link("stossy11", destination: URL(string: "https://github.com/stossy11")!)
-                                .font(.body.weight(.medium))
-                                .foregroundColor(.primary)
-                            
-                            Spacer()
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                        
-                        Divider().padding(.leading, 56)
-                        
-                        HStack(spacing: 12) {
-                            Image(systemName: "paintbrush.fill")
-                                .font(.system(size: 18))
-                                .foregroundColor(.orange)
-                                .frame(width: 28)
-                            
-                            Text("u/Zephyrax_g14")
-                                .font(.body.weight(.medium))
-                                .foregroundColor(.primary)
-                            
-                            Spacer()
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                        
-                        Divider().padding(.leading, 56)
-                        
-                        HStack(spacing: 12) {
-                            Image(systemName: "hammer.fill")
-                                .font(.system(size: 18))
-                                .foregroundColor(.gray)
-                                .frame(width: 28)
-                            
-                            Link("jkcoxson", destination: URL(string: "https://github.com/jkcoxson/idevice")!)
-                                .font(.body.weight(.medium))
-                                .foregroundColor(.primary)
-                            
-                            Spacer()
-                        }
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 16)
-                    }
-                    .background(Color(.systemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color(.systemGray5), lineWidth: 1)
-                    )
-                }
-
 
                 VStack(alignment: .leading, spacing: 12) {
                     Text("DEBUG")
@@ -676,9 +482,9 @@ struct SettingsView: View {
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .tracking(0.5)
-                    
+
                     VStack(spacing: 0) {
-                        
+
                         Button {
                             showingLogViewer = true
                         } label: {
@@ -687,13 +493,13 @@ struct SettingsView: View {
                                     .font(.body)
                                     .foregroundColor(.primary)
                                     .frame(width: 28)
-                                
+
                                 Text("Console")
                                     .font(.body)
                                     .foregroundColor(.primary)
-                                
+
                                 Spacer()
-                                
+
                                 Image(systemName: "chevron.right")
                                     .font(.caption)
                                     .foregroundColor(Color(.systemGray3))
@@ -701,9 +507,9 @@ struct SettingsView: View {
                             .padding(.vertical, 14)
                             .padding(.horizontal, 16)
                         }
-                        
+
                         Divider().padding(.leading, 56)
-                        
+
                         Button {
                             exportDatabase()
                         } label: {
@@ -717,13 +523,13 @@ struct SettingsView: View {
                                         .foregroundColor(.primary)
                                         .frame(width: 28)
                                 }
-                                
+
                                 Text(isExportingDb ? "Exporting…" : "Export Database")
                                     .font(.body)
                                     .foregroundColor(.primary)
-                                
+
                                 Spacer()
-                                
+
                                 Image(systemName: "square.and.arrow.up")
                                     .font(.caption)
                                     .foregroundColor(Color(.systemGray3))
@@ -831,12 +637,188 @@ struct SettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 12) {
+                    Text("ABOUT")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.secondary)
+                        .tracking(0.5)
+
+                    VStack(spacing: 0) {
+                        Button {
+                            if let settingsUpdate {
+                                openURL(settingsUpdate.releaseURL)
+                            } else {
+                                checkForSettingsUpdate()
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: "info.circle")
+                                    .font(.body)
+                                    .foregroundColor(.primary)
+                                    .frame(width: 28)
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Version")
+                                        .font(.body)
+                                        .foregroundColor(.primary)
+
+                                    Text(settingsUpdate == nil ? "Tap to check for updates" : "Tap to download the latest release")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Spacer()
+
+                                if isCheckingForUpdate {
+                                    ProgressView()
+                                } else {
+                                    Text(settingsUpdate.map { "Update \($0.version)" } ?? AppUpdateChecker.currentVersion)
+                                        .font(.subheadline)
+                                        .foregroundColor(settingsUpdate == nil ? .secondary : .accentColor)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+                        .disabled(isCheckingForUpdate)
+
+                        Divider().padding(.leading, 56)
+
+                        HStack {
+                            Image(systemName: "music.note")
+                                .font(.body)
+                                .foregroundColor(.primary)
+                                .frame(width: 28)
+
+                            Text("Music Formats")
+                                .font(.body)
+
+                            Spacer()
+
+                            Text("MP3, FLAC, M4A, WAV, Opus")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+
+                        Divider().padding(.leading, 56)
+
+                        HStack {
+                            Image(systemName: "bell.badge")
+                                .font(.body)
+                                .foregroundColor(.primary)
+                                .frame(width: 28)
+
+                            Text("Ringtone Formats")
+                                .font(.body)
+
+                            Spacer()
+
+                            Text("M4R, MP3 (Ringtones injection disabled for now")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+                    }
+                    .background(Color(.systemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color(.systemGray5), lineWidth: 1)
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("CREDITS")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.secondary)
+                        .tracking(0.5)
+
+                    VStack(spacing: 0) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundColor(.blue)
+                                .frame(width: 28)
+
+                            Link("EduAlexxis", destination: URL(string: "https://github.com/EduAlexxis")!)
+                                .font(.body.weight(.medium))
+                                .foregroundColor(.primary)
+
+                            Spacer()
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+
+                        Divider().padding(.leading, 56)
+
+                        HStack(spacing: 12) {
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundColor(.indigo)
+                                .frame(width: 28)
+
+                            Link("stossy11", destination: URL(string: "https://github.com/stossy11")!)
+                                .font(.body.weight(.medium))
+                                .foregroundColor(.primary)
+
+                            Spacer()
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+
+                        Divider().padding(.leading, 56)
+
+                        HStack(spacing: 12) {
+                            Image(systemName: "paintbrush.fill")
+                                .font(.system(size: 18))
+                                .foregroundColor(.orange)
+                                .frame(width: 28)
+
+                            Text("u/Zephyrax_g14")
+                                .font(.body.weight(.medium))
+                                .foregroundColor(.primary)
+
+                            Spacer()
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+
+                        Divider().padding(.leading, 56)
+
+                        HStack(spacing: 12) {
+                            Image(systemName: "hammer.fill")
+                                .font(.system(size: 18))
+                                .foregroundColor(.gray)
+                                .frame(width: 28)
+
+                            Link("jkcoxson", destination: URL(string: "https://github.com/jkcoxson/idevice")!)
+                                .font(.body.weight(.medium))
+                                .foregroundColor(.primary)
+
+                            Spacer()
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+                    }
+                    .background(Color(.systemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color(.systemGray5), lineWidth: 1)
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
                     Text("DANGER ZONE")
                         .font(.caption)
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .tracking(0.5)
-                    
+
                     Button {
                         showingDeleteAlert = true
                     } label: {
@@ -845,11 +827,11 @@ struct SettingsView: View {
                                 .font(.body)
                                 .foregroundColor(.red)
                                 .frame(width: 28)
-                            
+
                             Text("Delete Music Library")
                                 .font(.body)
                                 .foregroundColor(.red)
-                            
+
                             Spacer()
                         }
                         .padding(.vertical, 14)
@@ -862,8 +844,6 @@ struct SettingsView: View {
                         )
                     }
                 }
-
-                
 
                 }
                 .frame(width: max(proxy.size.width - 40, 0), alignment: .leading)
@@ -910,6 +890,9 @@ struct SettingsView: View {
             if downloadSearchProvider == DownloadSearchProviderOption.tidal.rawValue || downloadSearchProvider == DownloadSearchProviderOption.spotify.rawValue {
                 downloadSearchProvider = DownloadSearchProviderOption.appleMusic.rawValue
             }
+            if downloadSearchProvider == DownloadSearchProviderOption.metadata.rawValue {
+                downloadSearchProvider = DownloadSearchProviderOption.itunes.rawValue
+            }
         }
 
         if showToast {
@@ -942,14 +925,14 @@ struct SettingsView: View {
     // MARK: - Supporters
     private func fetchSupporters() async {
         guard !supportersLoaded || supporters.isEmpty else { return }
-        
+
         let timestamp = Int(Date().timeIntervalSince1970)
         guard let url = URL(string: "https://raw.githubusercontent.com/EduAlexxis/EduAlexxis-Altstore-Repo/main/supporters.json?t=\(timestamp)") else { return }
-        
+
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 10
-        
+
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
             struct Response: Decodable { let supporters: [String] }
@@ -1009,8 +992,6 @@ struct SettingsView: View {
         downloadNext(0)
     }
 
-
-
     private func checkForSettingsUpdate() {
         isCheckingForUpdate = true
         Task {
@@ -1041,24 +1022,24 @@ struct SettingsView: View {
             self.toastIcon = icon
             self.showToast = true
         }
-        
+
         let generator = UINotificationFeedbackGenerator()
         generator.notificationOccurred(.success)
-        
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             withAnimation(.easeOut(duration: 0.5)) {
                 self.showToast = false
             }
         }
     }
-    
+
     func handlePairingImport(url: URL?) {
         guard let url = url else { return }
-        
+
         do {
             try manager.importPairingFile(from: url)
             status = "\(manager.expectedPairingFileTitle) imported"
-            
+
             manager.startHeartbeat()
         } catch {
             status = error.localizedDescription
@@ -1096,21 +1077,18 @@ struct SettingsView: View {
 private struct DownloaderSettingsScreen: View {
     @Binding var metadataSource: String
     @Binding var autofetchMetadata: Bool
+    @Binding var keepLocalMetadataForLocalFiles: Bool
     @Binding var fetchLyrics: Bool
     @Binding var appleSubscriptionLyrics: Bool
     @Binding var storeRegion: String
     @Binding var appleRichMetadata: Bool
-    @Binding var downloadServer: String
     @Binding var downloadSearchProvider: String
     @Binding var keepDownloadedSongs: Bool
     @Binding var backgroundDownloadsEnabled: Bool
     @Binding var backgroundMetadataFetchEnabled: Bool
     @Binding var downloadLiveActivitiesEnabled: Bool
     @Binding var showingDownloadFolderPicker: Bool
-    @Binding var autoDownloadTier: String
     @Binding var yoinkifyFormat: String
-    @Binding var qobuzFallbackQuality: String
-    @Binding var tidalFallbackQuality: String
 
     let downloadFolderSubtitle: String
 
@@ -1149,10 +1127,44 @@ private struct DownloaderSettingsScreen: View {
                             icon: "wand.and.stars",
                             title: "Import Metadata Source",
                             subtitle: "How imported songs get matched.",
-                            info: "Choose which service ByeTunes uses to look up metadata for songs you import. Local Files uses only what's already tagged on the file; iTunes, Deezer, and Apple Music look up matches online to fill in and correct title, artist, album, and artwork.",
+                            info: "Choose which service ByeTunes uses to look up metadata for songs you import. Local Files uses only what's already tagged on the file; iTunes, Deezer, and Apple Music look up matches online to fill in and correct title, artist, album, and artwork. Deezer lookups are limited to the US catalog.",
                             selection: $metadataSource,
                             options: MetadataSourceOption.allCases
                         )
+
+                        Divider().padding(.leading, 56)
+
+                        Toggle(isOn: $keepLocalMetadataForLocalFiles) {
+                            HStack {
+                                Image(systemName: "lock.doc")
+                                    .font(.body)
+                                    .foregroundColor(.primary)
+                                    .frame(width: 28)
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Keep Local Metadata")
+                                        .font(.body)
+                                    Text("Don't fetch metadata for imported local files.")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Spacer()
+
+                                Button {
+                                    showInfo(
+                                        "Keep Local Metadata",
+                                        "When on, songs you import from local files (e.g. from Files or the share sheet) keep exactly the tags already on the file. None of the settings below are applied to them: no online lookup, no rich Apple metadata, no lyrics fetch. This has no effect on songs from the Download tab."
+                                    )
+                                } label: {
+                                    infoButton
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .toggleStyle(SwitchToggleStyle(tint: .accentColor))
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 16)
 
                         if metadataSource != "apple" {
                             Divider().padding(.leading, 56)
@@ -1296,17 +1308,40 @@ private struct DownloaderSettingsScreen: View {
                         .padding(.vertical, 10)
                         .padding(.horizontal, 16)
 
-                        if metadataSource == "itunes" {
+                        if metadataSource == "itunes" || metadataSource == "apple" || (metadataSource == "local" && appleRichMetadata) {
                             Divider().padding(.leading, 56)
 
-                            serverPickerRow(
-                                icon: "globe",
-                                title: "Store Region",
-                                subtitle: "Storefront for iTunes lookups.",
-                                info: "Choose which country's iTunes Store to query when looking up metadata. Some songs or metadata details are only available in certain storefronts.",
-                                selection: $storeRegion,
-                                options: MetadataStoreRegionOption.allCases
-                            )
+                            NavigationLink {
+                                RegionPickerScreen(selection: $storeRegion)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "globe")
+                                        .font(.body)
+                                        .foregroundColor(.primary)
+                                        .frame(width: 28)
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Store Region")
+                                            .font(.body)
+                                            .foregroundColor(.primary)
+                                        Text("Storefront for iTunes and Apple Music lookups.")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    Text(MetadataStoreRegionOption(rawValue: storeRegion).description)
+                                        .font(.body)
+                                        .foregroundColor(.secondary)
+
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption)
+                                        .foregroundColor(Color(.systemGray3))
+                                }
+                                .padding(.vertical, 14)
+                                .padding(.horizontal, 16)
+                            }
                         }
                     }
                     .background(Color(.systemBackground))
@@ -1327,7 +1362,7 @@ private struct DownloaderSettingsScreen: View {
                             icon: "magnifyingglass",
                             title: "Search Source",
                             subtitle: "Where the Download tab searches.",
-                            info: "Choose which service the Download tab searches for songs: Apple Music search results, or a match by metadata across all supported download sources.",
+                            info: "Choose which service the Download tab searches for songs: Apple Music, iTunes, or Deezer.",
                             selection: $downloadSearchProvider,
                             options: DownloadSearchProviderOption.allCases
                         )
@@ -1546,8 +1581,8 @@ private struct DownloaderSettingsScreen: View {
                         serverPickerRow(
                             icon: "sparkles.rectangle.stack",
                             title: "Output Format",
-                            subtitle: "Preferred download format.",
-                            info: "Choose your preferred audio format for downloads. ByeTunes is tried first; Deezer is used automatically as a fallback if a track isn't available there in your preferred format.",
+                            subtitle: "FLAC/ALAC when available, MP3 otherwise.",
+                            info: "FLAC and ALAC are lossless, but only available when a track is sourced from Deezer or Tidal. If a track isn't available lossless there, a 320kbps MP3 is downloaded instead automatically, and the queue will note when this happens for a specific song.",
                             selection: $yoinkifyFormat,
                             options: DownloaderYoinkifyFormatOption.allCases
                         )
@@ -1570,9 +1605,6 @@ private struct DownloaderSettingsScreen: View {
         }
         .navigationTitle("Metadata & Downloads")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            downloadServer = DownloaderServerPreference.auto.rawValue
-        }
         .alert(infoAlertTitle, isPresented: $showingInfoAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -1639,7 +1671,7 @@ private enum MetadataSourceOption: String, CaseIterable, Identifiable, CustomStr
         switch self {
         case .local: return "Local Files"
         case .itunes: return "iTunes API"
-        case .deezer: return "Deezer API"
+        case .deezer: return "Deezer API (US only)"
         case .apple: return "Apple Music"
         }
     }
@@ -1650,9 +1682,11 @@ private enum DownloadSearchProviderOption: String, CaseIterable, Identifiable, C
     case spotify
     case tidal
     case metadata
+    case itunes
+    case deezer
 
     static var allCases: [DownloadSearchProviderOption] {
-        [.appleMusic, .metadata]
+        [.appleMusic, .itunes, .deezer]
     }
 
     var id: String { rawValue }
@@ -1663,33 +1697,112 @@ private enum DownloadSearchProviderOption: String, CaseIterable, Identifiable, C
         case .spotify: return "Spotify"
         case .tidal: return "Tidal"
         case .metadata: return "iTunes + Deezer"
+        case .itunes: return "iTunes"
+        case .deezer: return "Deezer"
         }
     }
 }
 
-private enum MetadataStoreRegionOption: String, CaseIterable, Identifiable, CustomStringConvertible {
-    case us = "US"
-    case mx = "MX"
-    case es = "ES"
-    case gb = "GB"
-    case jp = "JP"
-    case br = "BR"
-    case de = "DE"
-    case fr = "FR"
+private struct RegionPickerScreen: View {
+    @Binding var selection: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
+
+    private var currentOption: MetadataStoreRegionOption {
+        MetadataStoreRegionOption(rawValue: selection)
+    }
+
+    private var groupedSections: [(letter: String, options: [MetadataStoreRegionOption])] {
+        let all = MetadataStoreRegionOption.allCases
+        let filtered = searchText.isEmpty ? all : all.filter {
+            $0.description.localizedCaseInsensitiveContains(searchText) ||
+            $0.rawValue.localizedCaseInsensitiveContains(searchText)
+        }
+        let grouped = Dictionary(grouping: filtered) { option in
+            String(option.description.prefix(1)).uppercased()
+        }
+        return grouped.keys.sorted().map { letter in
+            (letter, grouped[letter]!.sorted { $0.description < $1.description })
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                row(for: currentOption)
+            } header: {
+                Text("Current Region")
+            } footer: {
+                Text("Choose which country's storefront to query when looking up metadata. Some songs or metadata details are only available in certain storefronts.")
+            }
+
+            ForEach(groupedSections, id: \.letter) { section in
+                Section {
+                    ForEach(section.options) { option in
+                        row(for: option)
+                    }
+                } header: {
+                    Text(section.letter)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search countries")
+        .navigationTitle("Store Region")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func row(for option: MetadataStoreRegionOption) -> some View {
+        let isSelected = option.rawValue == selection
+        return Button {
+            selection = option.rawValue
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                Text(Self.flagEmoji(for: option.rawValue))
+                    .font(.title2)
+                Text(option.description)
+                    .foregroundColor(.primary)
+                    .fontWeight(isSelected ? .semibold : .regular)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .fontWeight(.semibold)
+                        .foregroundColor(.accentColor)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private static func flagEmoji(for regionCode: String) -> String {
+        let regionalIndicatorBase: UInt32 = 127397
+        var scalars = String.UnicodeScalarView()
+        for scalar in regionCode.uppercased().unicodeScalars {
+            guard let flagScalar = Unicode.Scalar(regionalIndicatorBase + scalar.value) else { continue }
+            scalars.append(flagScalar)
+        }
+        return scalars.isEmpty ? "🏳️" : String(scalars)
+    }
+}
+
+private struct MetadataStoreRegionOption: Identifiable, CustomStringConvertible, RawRepresentable {
+    let rawValue: String
+
+    init(rawValue: String) {
+        self.rawValue = rawValue
+    }
 
     var id: String { rawValue }
 
     var description: String {
-        switch self {
-        case .us: return "US"
-        case .mx: return "MX"
-        case .es: return "ES"
-        case .gb: return "GB"
-        case .jp: return "JP"
-        case .br: return "BR"
-        case .de: return "DE"
-        case .fr: return "FR"
-        }
+        Locale.current.localizedString(forRegionCode: rawValue) ?? rawValue
+    }
+
+    static var allCases: [MetadataStoreRegionOption] {
+        SongMetadata.storefrontMap.keys
+            .map { MetadataStoreRegionOption(rawValue: $0.uppercased()) }
+            .sorted { $0.description < $1.description }
     }
 }
 
