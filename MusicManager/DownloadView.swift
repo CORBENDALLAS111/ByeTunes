@@ -16,7 +16,6 @@ struct DownloadView: View {
     enum SearchProvider: String, CaseIterable, Identifiable {
         case appleMusic
         case spotify
-        case tidal
         case metadata
         case itunes
         case deezer
@@ -31,7 +30,6 @@ struct DownloadView: View {
             switch self {
             case .appleMusic: return "Apple Music"
             case .spotify: return "Spotify"
-            case .tidal: return "Tidal"
             case .metadata: return "iTunes + Deezer"
             case .itunes: return "iTunes"
             case .deezer: return "Deezer"
@@ -42,7 +40,6 @@ struct DownloadView: View {
             switch self {
             case .appleMusic: return "Search or paste an Apple music, Spotify or Deezer Link."
             case .spotify: return "Search or paste a Spotify link"
-            case .tidal: return "Search Tidal songs"
             case .metadata: return "Search iTunes and Deezer"
             case .itunes: return "Search iTunes songs"
             case .deezer: return "Search or paste a Deezer link"
@@ -53,7 +50,6 @@ struct DownloadView: View {
             switch self {
             case .appleMusic: return "Search a song and tap download"
             case .spotify: return "Search a song and tap download"
-            case .tidal: return "Search Tidal and tap download"
             case .metadata: return "Search iTunes and Deezer and tap download"
             case .itunes: return "Search iTunes and tap download"
             case .deezer: return "Search Deezer and tap download"
@@ -84,7 +80,7 @@ struct DownloadView: View {
     @Binding var songs: [SongMetadata]
     @Binding var status: String
     @StateObject private var vm = DownloadViewModel.shared
-    @AppStorage("downloadSearchProvider") private var searchProviderRaw = SearchProvider.appleMusic.rawValue
+    @AppStorage("downloadSearchProvider") private var searchProviderRaw = SearchProvider.deezer.rawValue
     @State private var query = ""
     @State private var handledEmittedCount = 0
     @State private var selectedPage: ResultsPage = .songs
@@ -106,10 +102,7 @@ struct DownloadView: View {
 
     private var searchProvider: SearchProvider {
         get {
-            guard let provider = SearchProvider(rawValue: searchProviderRaw) else {
-                return .appleMusic
-            }
-            return provider == .tidal ? .appleMusic : provider
+            SearchProvider(rawValue: searchProviderRaw) ?? .appleMusic
         }
         nonmutating set { searchProviderRaw = newValue.rawValue }
     }
@@ -303,7 +296,7 @@ struct DownloadView: View {
             handledEmittedCount = newCount
         }
         .onAppear {
-            if searchProviderRaw == SearchProvider.tidal.rawValue || searchProviderRaw == SearchProvider.spotify.rawValue {
+            if searchProviderRaw == "tidal" || searchProviderRaw == SearchProvider.spotify.rawValue {
                 searchProviderRaw = SearchProvider.appleMusic.rawValue
             }
             if searchProviderRaw == SearchProvider.metadata.rawValue {
@@ -1785,7 +1778,6 @@ enum DownloadDirectLinkPayload {
 struct BackendCandidate {
     let label: String
     let request: URLRequest?
-    let tidalAPIBaseURL: String?
     let customDownload: ((_ trackID: String, _ suggestedName: String, _ fallbackExtension: String) async throws -> URL)?
     var requestedFormat: String? = nil
 }
@@ -1801,12 +1793,6 @@ private struct PreparedBackgroundDownloadPlan {
     let fallbackExtension: String
 }
 
-private enum TidalAPIRegistry {
-    static let gistURL = "https://gist.githubusercontent.com/afkarxyz/2ce772b943321b9448b454f39403ce25/raw"
-    static let cacheKey = "rotatingTidalAPIBaseURLs"
-    static let lastUsedKey = "rotatingTidalAPILastUsedURL"
-    static let defaultBaseURLs: [String] = []
-}
 
 enum DownloadPlatform: String {
     case appleMusic
@@ -1867,10 +1853,6 @@ private enum DirectLinkKind {
     case appleAlbum(id: String, sourceURL: String)
     case appleArtist(id: String, sourceURL: String)
     case applePlaylist(id: String, sourceURL: String)
-    case tidalTrack(id: String, sourceURL: String)
-    case tidalAlbum(id: String, sourceURL: String)
-    case tidalArtist(id: String, sourceURL: String)
-    case tidalPlaylist(id: String, sourceURL: String)
     case spotifyTrack(id: String, sourceURL: String)
     case spotifyAlbum(id: String, sourceURL: String)
     case spotifyArtist(id: String, sourceURL: String)
@@ -1940,14 +1922,6 @@ enum DownloadSupport {
             .replacingOccurrences(of: "  ", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? "download" : cleaned
-    }
-
-    static func tidalTrackID(from urlString: String) -> String? {
-        guard let range = urlString.range(of: "/track/") else { return nil }
-        let tail = urlString[range.upperBound...]
-        let id = tail.split(separator: "?").first?.split(separator: "/").first
-        let value = id.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? nil : value
     }
 
     nonisolated static func normalizedSearchValue(_ value: String) -> String {
@@ -2104,12 +2078,6 @@ final class DownloadViewModel: ObservableObject {
     private let songPageSize = 25
     private let albumPageSize = 15
     private let playlistPageSize = 15
-    private var tidalCachedSearchTracks: [DownloadTrack] = []
-    private var tidalCachedSearchAlbums: [DownloadAlbum] = []
-    private var tidalCachedSearchArtists: [DownloadArtist] = []
-    private var tidalSearchItemsCache: [TidalSearchItem] = []
-    private var tidalTotalItemCount = 0
-    private var activeTidalSearchHost: String?
     private var metadataCachedSearchTracks: [DownloadTrack] = []
     private var metadataCachedSearchAlbums: [DownloadAlbum] = []
     private var metadataCachedSearchPlaylists: [DownloadAlbum] = []
@@ -2335,7 +2303,7 @@ final class DownloadViewModel: ObservableObject {
 
         let resolved: URL?
         switch track.provider {
-        case .appleMusic, .spotify, .metadata, .tidal, .itunes, .deezer:
+        case .appleMusic, .spotify, .metadata, .itunes, .deezer:
             resolved = await resolveITunesPreviewURL(for: track)
         }
 
@@ -2475,8 +2443,6 @@ final class DownloadViewModel: ObservableObject {
                     )
                 }
             }
-        case .tidal:
-            return await fetchTidalAlbumTracks(for: album)
         case .metadata, .itunes, .deezer:
             if let identifier = album.albumIdentifier,
                identifier.hasPrefix("deezer-album-"),
@@ -2548,7 +2514,7 @@ final class DownloadViewModel: ObservableObject {
                     )
                 } ?? []
             }
-        case .tidal, .metadata, .itunes, .deezer:
+        case .metadata, .itunes, .deezer:
             return []
         }
     }
@@ -2584,6 +2550,16 @@ final class DownloadViewModel: ObservableObject {
         if totalQueueCount > completedQueueCount {
             totalQueueCount = max(0, totalQueueCount - 1)
         }
+        // A track can fail fast (e.g. an immediate "unsupported source" check) while a background
+        // URLSession attempt for the same track is still in flight underneath it. Without telling
+        // the background manager to stand down, that stray task's eventual completion resurrects
+        // this row right back into the Failed section after the user already removed it.
+        if backgroundDownloadsEnabled {
+            cancelledBackgroundTrackIDs.insert(trackID)
+            Task {
+                await BackgroundAudioDownloadManager.shared.cancelDownloads(forTrackID: trackID)
+            }
+        }
         syncQueuePersistence()
     }
 
@@ -2597,6 +2573,16 @@ final class DownloadViewModel: ObservableObject {
         queueOrder.removeAll { failedIDs.contains($0) }
         if totalQueueCount > completedQueueCount {
             totalQueueCount = max(completedQueueCount, totalQueueCount - failedIDs.count)
+        }
+        if backgroundDownloadsEnabled {
+            for id in failedIDs {
+                cancelledBackgroundTrackIDs.insert(id)
+            }
+            Task {
+                for id in failedIDs {
+                    await BackgroundAudioDownloadManager.shared.cancelDownloads(forTrackID: id)
+                }
+            }
         }
         syncQueuePersistence()
     }
@@ -2668,7 +2654,6 @@ final class DownloadViewModel: ObservableObject {
         }
         lastSearchQuery = trimmed
         lastSearchProvider = provider
-        tidalCachedSearchTracks = []
         metadataCachedSearchTracks = []
         metadataCachedSearchAlbums = []
         metadataCachedSearchPlaylists = []
@@ -2700,12 +2685,6 @@ final class DownloadViewModel: ObservableObject {
         switch provider {
         case .appleMusic:
             artistResults = []
-            activeTidalSearchHost = nil
-            tidalCachedSearchArtists = []
-            tidalCachedSearchTracks = []
-            tidalCachedSearchAlbums = []
-            tidalSearchItemsCache = []
-            tidalTotalItemCount = 0
             let (songs, songsHaveMore) = await AppleMusicAPI.shared.searchSongsWithAvailability(query: trimmed, limit: songPageSize, offset: 0)
             let albums = await searchAlbums(query: trimmed, limit: albumPageSize, offset: 0)
             let playlists = await searchPlaylists(query: trimmed, limit: playlistPageSize, offset: 0)
@@ -2761,12 +2740,6 @@ final class DownloadViewModel: ObservableObject {
 
         case .spotify:
             artistResults = []
-            activeTidalSearchHost = nil
-            tidalCachedSearchArtists = []
-            tidalCachedSearchTracks = []
-            tidalCachedSearchAlbums = []
-            tidalSearchItemsCache = []
-            tidalTotalItemCount = 0
 
             let (songs, songsHaveMore) = await AppleMusicAPI.shared.searchSongsWithAvailability(query: trimmed, limit: songPageSize, offset: 0)
             let albums = await searchAlbums(query: trimmed, limit: albumPageSize, offset: 0)
@@ -2821,31 +2794,8 @@ final class DownloadViewModel: ObservableObject {
             canLoadMoreAlbums = albums.count == albumPageSize
             canLoadMorePlaylists = playlists.count == playlistPageSize
 
-        case .tidal:
-            activeTidalSearchHost = nil
-            let response = await fetchPreferredTidalSearchResponse(query: trimmed, limit: songPageSize, offset: 0, logLabel: "search display")
-            let items = response?.data.items ?? []
-            tidalSearchItemsCache = items
-            tidalTotalItemCount = response?.data.totalNumberOfItems ?? items.count
-            tidalCachedSearchTracks = mapTidalSearchItemsToTracks(items)
-            tidalCachedSearchAlbums = Array(uniqueAlbums(mapTidalSearchItemsToAlbums(items)).prefix(200))
-
-            artistResults = []
-            songResults = Array(tidalCachedSearchTracks.prefix(songPageSize))
-            albumResults = Array(tidalCachedSearchAlbums.prefix(albumPageSize))
-            playlistResults = []
-            canLoadMoreSongs = songResults.count < tidalTotalItemCount
-            canLoadMoreAlbums = albumResults.count < tidalCachedSearchAlbums.count || tidalSearchItemsCache.count < tidalTotalItemCount
-            canLoadMorePlaylists = false
-
         case .metadata:
-            activeTidalSearchHost = nil
             artistResults = []
-            tidalCachedSearchArtists = []
-            tidalCachedSearchTracks = []
-            tidalCachedSearchAlbums = []
-            tidalSearchItemsCache = []
-            tidalTotalItemCount = 0
 
             let batch = await fetchMetadataSearchTracks(
                 query: trimmed,
@@ -2867,13 +2817,7 @@ final class DownloadViewModel: ObservableObject {
             canLoadMorePlaylists = false
 
         case .itunes:
-            activeTidalSearchHost = nil
             artistResults = []
-            tidalCachedSearchArtists = []
-            tidalCachedSearchTracks = []
-            tidalCachedSearchAlbums = []
-            tidalSearchItemsCache = []
-            tidalTotalItemCount = 0
 
             let batch = await fetchMetadataSearchTracks(
                 query: trimmed,
@@ -2896,13 +2840,7 @@ final class DownloadViewModel: ObservableObject {
             canLoadMorePlaylists = false
 
         case .deezer:
-            activeTidalSearchHost = nil
             artistResults = []
-            tidalCachedSearchArtists = []
-            tidalCachedSearchTracks = []
-            tidalCachedSearchAlbums = []
-            tidalSearchItemsCache = []
-            tidalTotalItemCount = 0
 
             let batch = await fetchMetadataSearchTracks(
                 query: trimmed,
@@ -2982,16 +2920,6 @@ final class DownloadViewModel: ObservableObject {
                 !songResults.contains(where: { $0.id == incoming.id })
             })
             canLoadMoreSongs = songsHaveMore
-        case .tidal:
-            await expandTidalSearchCacheIfNeeded(minimumItemCount: songResults.count + songPageSize)
-            tidalCachedSearchTracks = mapTidalSearchItemsToTracks(tidalSearchItemsCache)
-            tidalCachedSearchAlbums = Array(uniqueAlbums(mapTidalSearchItemsToAlbums(tidalSearchItemsCache)).prefix(400))
-            let nextCount = min(songResults.count + songPageSize, tidalCachedSearchTracks.count)
-            songResults = Array(tidalCachedSearchTracks.prefix(nextCount))
-            albumResults = Array(tidalCachedSearchAlbums.prefix(max(albumResults.count, min(albumPageSize, tidalCachedSearchAlbums.count))))
-            canLoadMoreSongs = songResults.count < tidalTotalItemCount
-            canLoadMoreAlbums = albumResults.count < tidalCachedSearchAlbums.count || tidalSearchItemsCache.count < tidalTotalItemCount
-            canLoadMorePlaylists = false
         case .metadata:
             await expandMetadataSearchCacheIfNeeded(minimumTrackCount: songResults.count + songPageSize)
             let nextCount = min(songResults.count + songPageSize, metadataCachedSearchTracks.count)
@@ -3061,20 +2989,6 @@ final class DownloadViewModel: ObservableObject {
                 !albumResults.contains(where: { $0.id == incoming.id })
             })
             canLoadMoreAlbums = albums.count == albumPageSize
-        case .tidal:
-            let desiredAlbumCount = albumResults.count + albumPageSize
-            while tidalCachedSearchAlbums.count < desiredAlbumCount && tidalSearchItemsCache.count < tidalTotalItemCount {
-                await expandTidalSearchCacheIfNeeded(minimumAlbumCount: desiredAlbumCount)
-                tidalCachedSearchTracks = mapTidalSearchItemsToTracks(tidalSearchItemsCache)
-                tidalCachedSearchAlbums = Array(uniqueAlbums(mapTidalSearchItemsToAlbums(tidalSearchItemsCache)).prefix(400))
-                if tidalSearchItemsCache.count >= tidalTotalItemCount {
-                    break
-                }
-            }
-            albumResults = Array(tidalCachedSearchAlbums.prefix(min(desiredAlbumCount, tidalCachedSearchAlbums.count)))
-            canLoadMoreSongs = songResults.count < tidalTotalItemCount
-            canLoadMoreAlbums = albumResults.count < tidalCachedSearchAlbums.count || tidalSearchItemsCache.count < tidalTotalItemCount
-            canLoadMorePlaylists = false
         case .metadata:
             let desiredAlbumCount = albumResults.count + albumPageSize
             await expandMetadataSearchCacheIfNeeded(minimumAlbumCount: desiredAlbumCount)
@@ -3140,7 +3054,7 @@ final class DownloadViewModel: ObservableObject {
                 !playlistResults.contains(where: { $0.id == incoming.id })
             })
             canLoadMorePlaylists = playlists.count == playlistPageSize
-        case .tidal, .metadata, .itunes, .deezer:
+        case .metadata, .itunes, .deezer:
             canLoadMorePlaylists = false
         }
     }
@@ -3184,7 +3098,7 @@ final class DownloadViewModel: ObservableObject {
 
             return DownloadArtistProfile(tracks: tracks, albums: uniqueAlbums(mappedAlbums))
 
-        case .tidal, .metadata, .spotify, .itunes, .deezer:
+        case .metadata, .spotify, .itunes, .deezer:
             if artist.id.hasPrefix("deezer-artist-"),
                let numericID = Int(artist.id.dropFirst("deezer-artist-".count)) {
                 let profile = await buildDeezerArtistProfile(id: numericID, fallbackName: artist.name)
@@ -3308,75 +3222,6 @@ final class DownloadViewModel: ObservableObject {
                     helperText: "Choose the songs you want to download, or grab the full playlist in one tap."
                 )
             )
-            return true
-
-        case .tidalTrack(let id, let sourceURL):
-            if let mappedAppleLink = await resolveMappedDirectLink(from: sourceURL, platform: .appleMusic) {
-                return await handleDirectLinkSearch(mappedAppleLink)
-            }
-            if let fallbackTrack = await fetchTidalTrackFromPublicPage(sourceURL: sourceURL, fallbackID: id) {
-                pendingDirectLinkAction = DownloadDirectLinkAction(payload: .track(fallbackTrack))
-                return true
-            }
-            errorText = "Could not resolve that Tidal track link."
-            return true
-
-        case .tidalAlbum(let id, let sourceURL):
-            if let mappedAppleLink = await resolveMappedDirectLink(from: sourceURL, platform: .appleMusic) {
-                return await handleDirectLinkSearch(mappedAppleLink)
-            }
-            let fallbackAlbum = DownloadAlbum(
-                id: id,
-                name: "Tidal Album",
-                artistLine: "Unknown Artist",
-                artworkURL: nil,
-                sourceURL: sourceURL,
-                provider: .tidal,
-                artistIdentifier: nil,
-                albumIdentifier: id
-            )
-            let tracks = await fetchTidalAlbumTracks(for: fallbackAlbum)
-            guard !tracks.isEmpty else {
-                errorText = "Could not load that Tidal album link."
-                return true
-            }
-            let album = DownloadAlbum(
-                id: id,
-                name: tracks.first?.albumName ?? "Tidal Album",
-                artistLine: tracks.first?.artistLine ?? "Unknown Artist",
-                artworkURL: tracks.first?.artworkURL,
-                sourceURL: sourceURL,
-                provider: .tidal,
-                artistIdentifier: tracks.first?.artistIdentifier,
-                albumIdentifier: id
-            )
-            albumTrackIDs[album.id] = tracks.map(\.id)
-            pendingDirectLinkAction = DownloadDirectLinkAction(
-                payload: .collection(
-                    album: album,
-                    tracks: tracks,
-                    title: "Album Download",
-                    helperText: "Choose the tracks you want to download, or grab the full album in one tap."
-                )
-            )
-            return true
-
-        case .tidalArtist(let id, let sourceURL):
-            if let mappedAppleLink = await resolveMappedDirectLink(from: sourceURL, platform: .appleMusic) {
-                return await handleDirectLinkSearch(mappedAppleLink)
-            }
-            guard let artist = await fetchTidalArtist(id: id, sourceURL: sourceURL) else {
-                errorText = "Could not load that Tidal artist link."
-                return true
-            }
-            pendingDirectLinkAction = DownloadDirectLinkAction(payload: .artist(artist))
-            return true
-
-        case .tidalPlaylist(_, let sourceURL):
-            if let mappedAppleLink = await resolveMappedDirectLink(from: sourceURL, platform: .appleMusic) {
-                return await handleDirectLinkSearch(mappedAppleLink)
-            }
-            errorText = "Tidal playlist links are not supported by the current backends."
             return true
 
         case .spotifyTrack(let id, let sourceURL):
@@ -3879,41 +3724,6 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
-    private func expandTidalSearchCacheIfNeeded(minimumItemCount: Int? = nil, minimumAlbumCount: Int? = nil) async {
-        while true {
-            let hasEnoughItems = minimumItemCount.map { tidalSearchItemsCache.count >= $0 } ?? false
-            let currentAlbumCount = uniqueAlbums(mapTidalSearchItemsToAlbums(tidalSearchItemsCache)).count
-            let hasEnoughAlbums = minimumAlbumCount.map { currentAlbumCount >= $0 } ?? false
-
-            if minimumItemCount != nil, hasEnoughItems {
-                break
-            }
-            if minimumAlbumCount != nil, hasEnoughAlbums {
-                break
-            }
-            if tidalSearchItemsCache.count >= tidalTotalItemCount {
-                break
-            }
-
-            let response = await fetchPreferredTidalSearchResponse(
-                query: lastSearchQuery,
-                limit: songPageSize,
-                offset: tidalSearchItemsCache.count,
-                logLabel: "search display"
-            )
-            guard let response else { break }
-
-            let freshItems = response.data.items.filter { incoming in
-                !tidalSearchItemsCache.contains(where: { $0.id == incoming.id })
-            }
-            if freshItems.isEmpty {
-                break
-            }
-
-            tidalSearchItemsCache.append(contentsOf: freshItems)
-            tidalTotalItemCount = max(tidalTotalItemCount, response.data.totalNumberOfItems)
-        }
-    }
 
     /// Tops up the foreground worker pool to `maxConcurrentDownloads`, starting a new worker
     /// task per free slot. Safe to call repeatedly (e.g. after every enqueue and every worker
@@ -4455,6 +4265,18 @@ final class DownloadViewModel: ObservableObject {
         _ result: Result<BackgroundDownloadResult, Error>,
         for track: DownloadTrack
     ) async {
+        // The background URLSession delivers this completion whenever the OS gets around to it —
+        // sometimes well after the user has already removed the track from the Failed section.
+        // Without this guard, a stale completion for an already-removed track resurrects it by
+        // writing `.failed` straight back into trackStates even though it's no longer part of the
+        // live queue, which is what made removed Failed rows reappear (and then crash the second
+        // time they were swiped away, since the row's backing data was only half torn down).
+        guard !cancelledBackgroundTrackIDs.contains(track.id) else {
+            log("Ignoring recovered background result for \(track.id) — it was removed from the queue.")
+            clearActiveBackgroundTrack(track.id)
+            cancelledBackgroundTrackIDs.remove(track.id)
+            return
+        }
         switch result {
         case .success(let backgroundResult):
             do {
@@ -4545,13 +4367,24 @@ final class DownloadViewModel: ObservableObject {
 
         let candidates = try await primaryCandidates(for: resolvedSource, track: track)
         if !candidates.isEmpty {
-            if let outcome = try await executeCandidatesUntilSuccess(
-                candidates,
-                trackID: track.id,
-                suggestedName: "\(track.artistLine) - \(track.name)",
-                fallbackExtension: "flac"
-            ) {
-                return outcome
+            do {
+                // `executeCandidatesUntilSuccess` never actually returns nil — it either returns
+                // a real outcome or throws — so without this do/catch, any failure here (a real
+                // backend rejection, not just this `if let`'s vacuous nil case) propagated straight
+                // out of this function and the last-resort Spotify mapping below was never reached.
+                if let outcome = try await executeCandidatesUntilSuccess(
+                    candidates,
+                    trackID: track.id,
+                    suggestedName: "\(track.artistLine) - \(track.name)",
+                    fallbackExtension: "flac"
+                ) {
+                    return outcome
+                }
+            } catch {
+                if Task.isCancelled {
+                    throw error
+                }
+                log("Primary backend candidates failed for \(track.name): \(error.localizedDescription)")
             }
         }
 
@@ -4665,7 +4498,7 @@ final class DownloadViewModel: ObservableObject {
                 "genreSource": source.backendGenreSource,
                 "syncedLyrics": wantsSyncedLyrics
             ])
-            return BackendCandidate(label: label, request: request, tidalAPIBaseURL: nil, customDownload: nil, requestedFormat: format)
+            return BackendCandidate(label: label, request: request, customDownload: nil, requestedFormat: format)
         }
 
         var candidates = [try makeCandidate(label: Config.downloadBackendLabel, format: desiredFormat)]
@@ -4702,99 +4535,6 @@ final class DownloadViewModel: ObservableObject {
 
     private func desiredDownloadFormat() -> String {
         return UserDefaults.standard.string(forKey: "yoinkifyFormat") ?? "flac"
-    }
-
-    private func rotatedTidalTrackBackends() async -> [(label: String, baseURL: String)] {
-        let fallback = TidalAPIRegistry.defaultBaseURLs
-        let fetched = await fetchRemoteTidalAPIBaseURLs()
-        let cached = loadCachedTidalAPIBaseURLs()
-
-        let merged = normalizeTidalAPIBaseURLs(fetched + cached + fallback)
-        if merged != cached {
-            saveCachedTidalAPIBaseURLs(merged)
-        }
-
-        let rotated = rotateTidalAPIBaseURLs(
-            merged.isEmpty ? fallback : merged,
-            lastUsed: UserDefaults.standard.string(forKey: TidalAPIRegistry.lastUsedKey)
-        )
-
-        return rotated.map { baseURL in
-            let host = URL(string: baseURL)?.host ?? baseURL
-            return (label: "Tidal API (\(host))", baseURL: baseURL)
-        }
-    }
-
-    private func rotatedTidalSearchHosts() async -> [String] {
-        var searchHosts = await rotatedTidalTrackBackends().map { "\($0.baseURL)/search/" }
-
-        if let activeTidalSearchHost,
-           let index = searchHosts.firstIndex(of: activeTidalSearchHost) {
-            let preferred = searchHosts.remove(at: index)
-            searchHosts.insert(preferred, at: 0)
-        }
-
-        return searchHosts
-    }
-
-    private func fetchRemoteTidalAPIBaseURLs() async -> [String] {
-        guard let url = URL(string: TidalAPIRegistry.gistURL) else { return [] }
-
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 12
-            let (data, response) = try await session.data(for: request)
-            try validateHTTP(response: response, data: data)
-            let decoded = try JSONDecoder().decode([String].self, from: data)
-            let normalized = normalizeTidalAPIBaseURLs(decoded)
-            if !normalized.isEmpty {
-                log("Loaded \(normalized.count) rotating Tidal API base URLs from gist.")
-            }
-            return normalized
-        } catch {
-            log("Failed to refresh rotating Tidal API list: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    private func loadCachedTidalAPIBaseURLs() -> [String] {
-        guard let cached = UserDefaults.standard.array(forKey: TidalAPIRegistry.cacheKey) as? [String] else {
-            return []
-        }
-        return normalizeTidalAPIBaseURLs(cached)
-    }
-
-    private func saveCachedTidalAPIBaseURLs(_ urls: [String]) {
-        UserDefaults.standard.set(urls, forKey: TidalAPIRegistry.cacheKey)
-    }
-
-    private func normalizeTidalAPIBaseURLs(_ urls: [String]) -> [String] {
-        var seen = Set<String>()
-        var normalized: [String] = []
-
-        for raw in urls {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let value = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
-            guard let host = URL(string: value)?.host, !host.isEmpty else { continue }
-            guard seen.insert(value).inserted else { continue }
-            normalized.append(value)
-        }
-
-        return normalized
-    }
-
-    private func rotateTidalAPIBaseURLs(_ urls: [String], lastUsed: String?) -> [String] {
-        guard let lastUsed, !lastUsed.isEmpty else { return urls }
-        guard let lastIndex = urls.firstIndex(of: lastUsed) else { return urls }
-        let nextIndex = urls.index(after: lastIndex)
-        let head = nextIndex < urls.endIndex ? Array(urls[nextIndex...]) : []
-        let tail = Array(urls[...lastIndex])
-        return head + tail
-    }
-
-    private func rememberTidalAPIBaseURLSuccess(_ baseURL: String) {
-        UserDefaults.standard.set(baseURL, forKey: TidalAPIRegistry.lastUsedKey)
     }
 
     private func executeCandidatesUntilSuccess(
@@ -4842,9 +4582,6 @@ final class DownloadViewModel: ObservableObject {
                     )
                 } else {
                     throw DownloadError.mappingFailed("No usable backend request was created for \(candidate.label).")
-                }
-                if let tidalAPIBaseURL = candidate.tidalAPIBaseURL {
-                    rememberTidalAPIBaseURLSuccess(tidalAPIBaseURL)
                 }
                 log("\(candidate.label) backend succeeded.")
                 BackendHealthStore.shared.recordSuccess(label: candidate.label)
@@ -5285,142 +5022,8 @@ final class DownloadViewModel: ObservableObject {
         return mapped
     }
 
-    private func fetchPreferredTidalSearchResponse(
-        query: String,
-        limit: Int = 25,
-        offset: Int = 0,
-        logLabel: String
-    ) async -> TidalSearchResponse? {
-        let searchHosts = await rotatedTidalSearchHosts()
-
-        var sawResolvableFailure = false
-
-        for host in searchHosts {
-            do {
-                let response = try await fetchTidalSearchResponse(query: query, host: host, limit: limit, offset: offset)
-                activeTidalSearchHost = host
-                if !response.data.items.isEmpty {
-                    log("Tidal \(logLabel) host \(host) returned \(response.data.items.count) candidate(s) for '\(query)'")
-                }
-                return response
-            } catch {
-                sawResolvableFailure = sawResolvableFailure || isTransientSearchFailure(error)
-                log("Tidal \(logLabel) host \(host) failed for '\(query)': \(error.localizedDescription)")
-            }
-        }
-
-        if sawResolvableFailure {
-            errorText = "Tidal search backends are temporarily unavailable."
-        }
-        return nil
-    }
-
-    private func fetchTidalSearchResponse(query: String, host: String, limit: Int = 25, offset: Int = 0) async throws -> TidalSearchResponse {
-        var lastError: Error?
-
-        for attempt in 1...2 {
-            do {
-                var components = URLComponents(string: host)!
-                components.queryItems = [
-                    URLQueryItem(name: "s", value: query),
-                    URLQueryItem(name: "limit", value: String(limit)),
-                    URLQueryItem(name: "offset", value: String(offset))
-                ]
-
-                guard let url = components.url else {
-                    throw DownloadError.invalidURL(host)
-                }
-
-                let (data, response) = try await session.data(for: URLRequest(url: url))
-                try validateHTTP(response: response, data: data)
-                return try JSONDecoder().decode(TidalSearchResponse.self, from: data)
-            } catch {
-                lastError = error
-                guard attempt < 2, isTransientSearchFailure(error) else { throw error }
-                log("Retrying Tidal search host \(host) for '\(query)' after transient failure.")
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
-        }
-
-        throw lastError ?? DownloadError.searchFailed
-    }
-
-    private func isTransientSearchFailure(_ error: Error) -> Bool {
-        guard let urlError = error as? URLError else { return false }
-        switch urlError.code {
-        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .networkConnectionLost, .notConnectedToInternet:
-            return true
-        default:
-            return false
-        }
-    }
-
-    private func scoreDisplayTidalCandidate(_ candidate: TidalSearchItem, query: String) -> Int {
-        let normalizedQuery = DownloadSupport.normalizedSearchValue(query)
-        let title = DownloadSupport.normalizedSearchValue(candidate.title)
-        let combinedTitle = DownloadSupport.normalizedSearchValue(displayTitle(for: candidate))
-        let artistLine = DownloadSupport.normalizedSearchValue(tidalArtistLine(for: candidate))
-        let albumTitle = DownloadSupport.normalizedSearchValue(candidate.album?.title ?? "")
-
-        var score = 0
-
-        if combinedTitle == normalizedQuery {
-            score += 180
-        } else if title == normalizedQuery {
-            score += 160
-        } else if combinedTitle.contains(normalizedQuery) || normalizedQuery.contains(combinedTitle) {
-            score += 120
-        } else if title.contains(normalizedQuery) || normalizedQuery.contains(title) {
-            score += 95
-        }
-
-        for token in normalizedQuery.split(separator: " ").map(String.init) where token.count > 1 {
-            if artistLine.contains(token) {
-                score += 20
-            }
-            if albumTitle.contains(token) {
-                score += 8
-            }
-        }
-
-        if candidate.audioQuality?.uppercased().contains("LOSSLESS") == true {
-            score += 5
-        }
-
-        return score
-    }
-
-    private func displayTitle(for candidate: TidalSearchItem) -> String {
-        guard let version = candidate.version?.trimmingCharacters(in: .whitespacesAndNewlines), !version.isEmpty else {
-            return candidate.title
-        }
-
-        let normalizedTitle = DownloadSupport.normalizedSearchValue(candidate.title)
-        let normalizedVersion = DownloadSupport.normalizedSearchValue(version)
-        guard !normalizedVersion.isEmpty, !normalizedTitle.contains(normalizedVersion) else {
-            return candidate.title
-        }
-
-        return "\(candidate.title) (\(version))"
-    }
-
-    private func tidalArtistLine(for candidate: TidalSearchItem) -> String {
-        let artists = candidate.artists?.map(\.name) ?? [candidate.artist?.name].compactMap { $0 }
-        let filtered = artists.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        if filtered.isEmpty {
-            return "Unknown Artist"
-        }
-        return filtered.joined(separator: ", ")
-    }
-
     private func mappingSeedURL(for sourceURL: String) -> String {
         sourceURL
-    }
-
-    private func tidalImageURL(for identifier: String?, size: Int = 320) -> URL? {
-        guard let identifier, !identifier.isEmpty else { return nil }
-        let path = identifier.replacingOccurrences(of: "-", with: "/")
-        return URL(string: "https://resources.tidal.com/images/\(path)/\(size)x\(size).jpg")
     }
 
     private func fetchDataWithProgress(
@@ -5476,60 +5079,6 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
-    private func searchTidalTracks(query: String, limit: Int = 25, offset: Int = 0) async -> [DownloadTrack] {
-        guard let response = await fetchPreferredTidalSearchResponse(query: query, limit: limit, offset: offset, logLabel: "search display") else {
-            return []
-        }
-
-        let rankedCandidates = response.data.items
-            .map { candidate in
-                (candidate, scoreDisplayTidalCandidate(candidate, query: query))
-            }
-            .sorted {
-                if $0.1 == $1.1 {
-                    return $0.0.id < $1.0.id
-                }
-                return $0.1 > $1.1
-            }
-            .map(\.0)
-
-        return mapTidalSearchItemsToTracks(rankedCandidates)
-    }
-
-    private func mapTidalSearchItemsToTracks(_ items: [TidalSearchItem]) -> [DownloadTrack] {
-        items.map { item in
-            DownloadTrack(
-                id: String(item.id),
-                name: displayTitle(for: item),
-                artistLine: tidalArtistLine(for: item),
-                albumName: item.album?.title ?? "Unknown Album",
-                artworkURL: tidalImageURL(for: item.album?.cover),
-                isExplicit: item.explicit ?? false,
-                sourceURL: item.url ?? "https://tidal.com/browse/track/\(item.id)",
-                sourceContext: .song,
-                provider: .tidal,
-                artistIdentifier: item.artists?.first?.id.map(String.init) ?? item.artist?.id.map(String.init),
-                albumIdentifier: item.album?.id.map(String.init),
-                previewURL: nil
-            )
-        }
-    }
-
-    private func mapTidalSearchItemsToAlbums(_ items: [TidalSearchItem]) -> [DownloadAlbum] {
-        items.compactMap { item in
-            guard let album = item.album else { return nil }
-            return DownloadAlbum(
-                id: album.id.map(String.init) ?? "\(DownloadSupport.normalizedSearchValue(tidalArtistLine(for: item)))-\(DownloadSupport.normalizedSearchValue(album.title))",
-                name: album.title,
-                artistLine: tidalArtistLine(for: item),
-                artworkURL: tidalImageURL(for: album.cover),
-                sourceURL: item.url ?? "https://tidal.com/browse/album/\(album.id ?? 0)",
-                provider: .tidal,
-                artistIdentifier: item.artists?.first?.id.map(String.init) ?? item.artist?.id.map(String.init),
-                albumIdentifier: album.id.map(String.init)
-            )
-        }
-    }
 
     private func metadataTrack(from song: iTunesSong) -> DownloadTrack? {
         guard
@@ -5638,190 +5187,6 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
-    private func fetchTidalAlbumTracks(for album: DownloadAlbum) async -> [DownloadTrack] {
-        if let albumIDString = album.albumIdentifier ?? Int(album.id).map(String.init),
-           let albumID = Int(albumIDString),
-           let exactTracks = await fetchTidalAlbumTracks(albumID: albumID, fallbackAlbum: album),
-           !exactTracks.isEmpty {
-            return exactTracks
-        }
-
-        let query = "\(album.artistLine) \(album.name)"
-        let tracks = await searchTidalTracks(query: query, limit: 75)
-        if let albumIdentifier = album.albumIdentifier {
-            let exactAlbumID = tracks.filter { $0.albumIdentifier == albumIdentifier }
-            if !exactAlbumID.isEmpty {
-                return exactAlbumID
-            }
-        }
-
-        let exactAlbum = tracks.filter { track in
-            matchesArtistLine(track.artistLine, artistName: album.artistLine) &&
-            DownloadSupport.normalizedSearchValue(track.albumName) == DownloadSupport.normalizedSearchValue(album.name)
-        }
-
-        if !exactAlbum.isEmpty {
-            return exactAlbum
-        }
-
-        return tracks.filter {
-            DownloadSupport.normalizedSearchValue($0.albumName) == DownloadSupport.normalizedSearchValue(album.name)
-        }
-    }
-
-    private func fetchTidalAlbumTracks(albumID: Int, fallbackAlbum: DownloadAlbum) async -> [DownloadTrack]? {
-        guard let host = await preferredTidalBaseURL() else { return nil }
-        guard var components = URLComponents(string: "\(host)/album/") else { return nil }
-        components.queryItems = [
-            URLQueryItem(name: "id", value: String(albumID)),
-            URLQueryItem(name: "limit", value: "500")
-        ]
-        guard let url = components.url else { return nil }
-
-        do {
-            let (data, response) = try await session.data(for: URLRequest(url: url))
-            try validateHTTP(response: response, data: data)
-            let decoded = try JSONDecoder().decode(TidalAlbumResponse.self, from: data)
-            let albumData = decoded.data
-            return albumData.items.map { wrapper in
-                let item = wrapper.item
-                return DownloadTrack(
-                    id: String(item.id),
-                    name: displayTitle(for: item),
-                    artistLine: tidalArtistLine(for: item),
-                    albumName: albumData.title,
-                    artworkURL: tidalImageURL(for: albumData.cover),
-                    isExplicit: item.explicit ?? albumData.explicit ?? false,
-                    sourceURL: item.url ?? "https://tidal.com/browse/track/\(item.id)",
-                    sourceContext: .album,
-                    provider: .tidal,
-                    artistIdentifier: item.artists?.first?.id.map(String.init) ?? item.artist?.id.map(String.init),
-                    albumIdentifier: String(albumData.id),
-                    previewURL: nil
-                )
-            }
-        } catch {
-            log("Tidal album fetch failed for \(albumID): \(error.localizedDescription)")
-            return nil
-        }
-    }
-
-    private func fetchTidalArtist(id: String, sourceURL: String? = nil) async -> DownloadArtist? {
-        guard let artistID = Int(id) else { return nil }
-        let hosts = await tidalBaseURLCandidates()
-
-        for host in hosts {
-            guard var components = URLComponents(string: "\(host)/artist/") else { continue }
-            components.queryItems = [
-                URLQueryItem(name: "f", value: String(artistID)),
-                URLQueryItem(name: "skip_tracks", value: "true")
-            ]
-            guard let url = components.url else { continue }
-
-            do {
-                let (data, response) = try await session.data(for: URLRequest(url: url))
-                try validateHTTP(response: response, data: data)
-                let decoded = try JSONDecoder().decode(TidalArtistAlbumsResponse.self, from: data)
-                guard let artist = decoded.artist else { continue }
-                return DownloadArtist(
-                    id: String(artist.id),
-                    name: artist.name,
-                    provider: .tidal,
-                    artworkURL: tidalImageURL(for: artist.picture)
-                )
-            } catch {
-                log("Tidal artist fetch failed for \(artistID) via \(host): \(error.localizedDescription)")
-            }
-        }
-
-        if let sourceURL,
-           let fallbackArtist = await fetchTidalArtistFromPublicPage(sourceURL: sourceURL, fallbackID: id) {
-            return fallbackArtist
-        }
-
-        return nil
-    }
-
-    private func fetchTidalArtistFromPublicPage(sourceURL: String, fallbackID: String) async -> DownloadArtist? {
-        guard let url = URL(string: sourceURL) else { return nil }
-
-        do {
-            let (data, response) = try await session.data(from: url)
-            try validateHTTP(response: response, data: data)
-            guard let html = String(data: data, encoding: .utf8), !html.isEmpty else { return nil }
-
-            let rawTitle =
-                extractHTMLMetaContent(property: "og:title", in: html) ??
-                extractHTMLMetaContent(name: "twitter:title", in: html) ??
-                extractHTMLTagContent(tag: "title", in: html)
-
-            let artwork =
-                extractHTMLMetaContent(property: "og:image", in: html) ??
-                extractHTMLMetaContent(name: "twitter:image", in: html)
-
-            let cleanedTitle = rawTitle?
-                .replacingOccurrences(of: "| TIDAL", with: "")
-                .replacingOccurrences(of: " on TIDAL", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            guard let name = cleanedTitle, !name.isEmpty else { return nil }
-
-            return DownloadArtist(
-                id: fallbackID,
-                name: name,
-                provider: .tidal,
-                artworkURL: artwork.flatMap(URL.init(string:))
-            )
-        } catch {
-            log("Tidal public page artist fallback failed for \(sourceURL): \(error.localizedDescription)")
-            return nil
-        }
-    }
-
-    private func fetchTidalTrackFromPublicPage(sourceURL: String, fallbackID: String) async -> DownloadTrack? {
-        guard let url = URL(string: sourceURL) else { return nil }
-
-        do {
-            let (data, response) = try await session.data(from: url)
-            try validateHTTP(response: response, data: data)
-            guard let html = String(data: data, encoding: .utf8), !html.isEmpty else { return nil }
-
-            let rawTitle =
-                extractHTMLMetaContent(property: "og:title", in: html) ??
-                extractHTMLMetaContent(name: "twitter:title", in: html) ??
-                extractHTMLTagContent(tag: "title", in: html)
-
-            let rawDescription =
-                extractHTMLMetaContent(property: "og:description", in: html) ??
-                extractHTMLMetaContent(name: "description", in: html) ??
-                extractHTMLMetaContent(name: "twitter:description", in: html)
-
-            let artwork =
-                extractHTMLMetaContent(property: "og:image", in: html) ??
-                extractHTMLMetaContent(name: "twitter:image", in: html)
-
-            let parsed = parseTidalTrackMetadata(title: rawTitle, description: rawDescription)
-            guard let title = parsed.title, !title.isEmpty else { return nil }
-
-            return DownloadTrack(
-                id: fallbackID,
-                name: title,
-                artistLine: parsed.artist ?? "Unknown Artist",
-                albumName: parsed.album ?? "Unknown Album",
-                artworkURL: artwork.flatMap(URL.init(string:)),
-                isExplicit: false,
-                sourceURL: sourceURL,
-                sourceContext: .song,
-                provider: .tidal,
-                artistIdentifier: nil,
-                albumIdentifier: nil,
-                previewURL: nil
-            )
-        } catch {
-            log("Tidal public page track fallback failed for \(sourceURL): \(error.localizedDescription)")
-            return nil
-        }
-    }
 
     private func fetchSpotifyToken() async -> String? {
         guard let url = URL(string: "https://open.spotify.com/get_access_token?reason=transport&productType=web_player") else { return nil }
@@ -6531,92 +5896,6 @@ final class DownloadViewModel: ObservableObject {
         return await fetchSpotifyArtistFromPublicPage(sourceURL: sourceURL, fallbackID: id)
     }
 
-    private func tidalBaseURLCandidates() async -> [String] {
-        var candidates: [String] = []
-
-        if let activeTidalSearchHost {
-            let stripped = activeTidalSearchHost.replacingOccurrences(of: "/search/", with: "")
-            if !stripped.isEmpty {
-                candidates.append(stripped)
-            }
-        }
-
-        let rotated = await rotatedTidalTrackBackends().map(\.baseURL)
-        candidates.append(contentsOf: rotated)
-
-        var seen = Set<String>()
-        return candidates.filter { seen.insert($0).inserted }
-    }
-
-    private func parseTidalTrackMetadata(title: String?, description: String?) -> (title: String?, artist: String?, album: String?) {
-        let cleanedTitle = title?
-            .replacingOccurrences(of: "| TIDAL", with: "")
-            .replacingOccurrences(of: " on TIDAL", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var parsedTitle = cleanedTitle
-        var parsedArtist: String?
-        var parsedAlbum: String?
-
-        if let cleanedTitle, let byRange = cleanedTitle.range(of: " by ", options: .caseInsensitive) {
-            parsedTitle = String(cleanedTitle[..<byRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            parsedArtist = String(cleanedTitle[byRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        if let cleanedTitle,
-           parsedArtist == nil,
-           let dashRange = cleanedTitle.range(of: " - "),
-           dashRange.lowerBound != cleanedTitle.startIndex,
-           dashRange.upperBound != cleanedTitle.endIndex {
-            let left = String(cleanedTitle[..<dashRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let right = String(cleanedTitle[dashRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !left.isEmpty, !right.isEmpty {
-                parsedArtist = left
-                parsedTitle = right
-            }
-        }
-
-        if let description {
-            if parsedArtist == nil,
-               let match = firstRegexCapture(
-                in: description,
-                pattern: #"(?i)(?:listen to|stream|watch)\s+(.+?)\s+by\s+(.+?)(?:\s+on\s+tidal|\s+from\s+the\s+album|\.)"#,
-                group: 2
-               ) {
-                parsedArtist = match.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-
-            if (parsedTitle == nil || parsedTitle?.isEmpty == true),
-               let match = firstRegexCapture(
-                in: description,
-                pattern: #"(?i)(?:listen to|stream|watch)\s+(.+?)\s+by\s+(.+?)(?:\s+on\s+tidal|\s+from\s+the\s+album|\.)"#,
-                group: 1
-               ) {
-                parsedTitle = match.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-
-            if let albumMatch = firstRegexCapture(
-                in: description,
-                pattern: #"(?i)from\s+the\s+album\s+(.+?)(?:\.|$)"#,
-                group: 1
-            ) {
-                parsedAlbum = albumMatch.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-
-        parsedArtist = parsedArtist?
-            .replacingOccurrences(of: "| TIDAL", with: "")
-            .replacingOccurrences(of: " on TIDAL", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        parsedAlbum = parsedAlbum?
-            .replacingOccurrences(of: "| TIDAL", with: "")
-            .replacingOccurrences(of: " on TIDAL", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return (parsedTitle, parsedArtist, parsedAlbum)
-    }
-
     private func extractHTMLMetaContent(property: String, in html: String) -> String? {
         let patterns = [
             #"<meta[^>]*property=["']\#(property)["'][^>]*content=["']([^"']+)["'][^>]*>"#,
@@ -6804,14 +6083,6 @@ final class DownloadViewModel: ObservableObject {
         }
         
         return (albumResult, parsedTracks)
-    }
-
-    private func preferredTidalBaseURL() async -> String? {
-        if let activeTidalSearchHost {
-            return activeTidalSearchHost.replacingOccurrences(of: "/search/", with: "")
-        }
-        let backends = await rotatedTidalTrackBackends()
-        return backends.first?.baseURL
     }
 
     private func uniqueAlbums(_ albums: [DownloadAlbum]) -> [DownloadAlbum] {
@@ -7759,108 +7030,3 @@ private struct AppleMusicPlaylistTracksPage: Decodable {
     let data: [AppleMusicAPI.AppleMusicSong]
 }
 
-private struct TidalSearchResponse: Decodable {
-    let data: TidalSearchData
-}
-
-private struct TidalSearchData: Decodable {
-    let limit: Int?
-    let offset: Int?
-    let totalNumberOfItems: Int
-    let items: [TidalSearchItem]
-}
-
-private struct TidalSearchItem: Decodable {
-    let id: Int
-    let title: String
-    let version: String?
-    let url: String?
-    let explicit: Bool?
-    let audioQuality: String?
-    let artist: TidalSearchArtist?
-    let artists: [TidalSearchArtist]?
-    let album: TidalSearchAlbum?
-}
-
-private struct TidalSearchArtist: Decodable {
-    let id: Int?
-    let name: String
-    let picture: String?
-}
-
-private struct TidalSearchAlbum: Decodable {
-    let id: Int?
-    let title: String
-    let cover: String?
-}
-
-private struct TidalAlbumResponse: Decodable {
-    let data: TidalAlbumPayload
-}
-
-private struct TidalAlbumPayload: Decodable {
-    let id: Int
-    let title: String
-    let cover: String?
-    let explicit: Bool?
-    let items: [TidalAlbumItemWrapper]
-}
-
-private struct TidalAlbumItemWrapper: Decodable {
-    let item: TidalSearchItem
-    let type: String?
-}
-
-private struct TidalArtistAlbumsResponse: Decodable {
-    let artist: TidalArtistDetail?
-    let albums: TidalArtistAlbumList
-}
-
-private struct TidalArtistDetail: Decodable {
-    let id: Int
-    let name: String
-    let picture: String?
-}
-
-private struct TidalArtistAlbumList: Decodable {
-    let items: [TidalArtistAlbum]
-}
-
-private struct TidalArtistAlbum: Decodable {
-    let id: Int
-    let title: String
-    let url: String?
-    let cover: String?
-    let artist: TidalSearchArtist?
-}
-
-private struct QobuzSearchResponse: Decodable {
-    let tracks: QobuzSearchTrackList
-}
-
-private struct QobuzSearchTrackList: Decodable {
-    let total: Int?
-    let items: [QobuzSearchTrackItem]
-}
-
-private struct QobuzSearchTrackItem: Decodable {
-    let id: Int
-    let title: String
-    let version: String?
-    let isrc: String?
-    let duration: Int?
-    let downloadable: Bool?
-    let performer: QobuzSearchArtistInfo?
-    let album: QobuzSearchAlbumInfo
-}
-
-private struct QobuzSearchArtistInfo: Decodable {
-    let id: Int?
-    let name: String
-}
-
-private struct QobuzSearchAlbumInfo: Decodable {
-    let id: String
-    let title: String
-    let artist: QobuzSearchArtistInfo
-}

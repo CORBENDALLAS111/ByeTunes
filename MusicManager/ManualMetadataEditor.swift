@@ -13,7 +13,10 @@ struct ManualMetadataEditor: View {
     @State private var year: String = ""
     @State private var trackNumber: String = ""
     @State private var lyrics: String = ""
-    @State private var isExplicit: Bool = false
+    // content_rating is 3-state on device (0 = none, 1 = explicit, 2 = clean) — a plain on/off
+    // toggle here could only ever write 0 or 1, so saving a "clean"-tagged song without even
+    // touching this control used to silently flip it back to fully explicit.
+    @State private var explicitRating: Int = 0
 
     @State private var useCustomAlbumColor: Bool = false
     @State private var customAlbumColor: Color = .black
@@ -27,7 +30,7 @@ struct ManualMetadataEditor: View {
     @State private var showingSearchSheet = false
     @State private var showingLyricsSearchSheet = false
 
-    @AppStorage("metadataSource") private var metadataSource = "local"
+    @AppStorage("metadataSource") private var metadataSource = "apple"
 
     @FocusState private var focusedField: Field?
 
@@ -182,14 +185,16 @@ struct ManualMetadataEditor: View {
                     }
                     .padding(.vertical, 4)
                     
-                    Toggle(isOn: $isExplicit) {
-                        HStack(spacing: 8) {
-                            Text("🅴")
-                                .font(.caption.weight(.black))
-                                .foregroundColor(.red)
-                            Text("Explicit")
-                                .font(.body)
+                    HStack {
+                        Text("Content Rating")
+                        Spacer()
+                        Picker("", selection: $explicitRating) {
+                            Text("None").tag(0)
+                            Text("Explicit").tag(1)
+                            Text("Clean").tag(2)
                         }
+                        .pickerStyle(.menu)
+                        .tint(.secondary)
                     }
                     .padding(.vertical, 4)
 
@@ -349,7 +354,7 @@ struct ManualMetadataEditor: View {
         artworkData = resolvedArtworkData
         originalArtworkData = resolvedArtworkData
         pendingArtworkData = nil
-        isExplicit = song.explicitRating > 0
+        explicitRating = max(0, song.explicitRating)
         if let hex = song.customAlbumBackgroundColor,
            let color = Self.color(fromHex: hex) {
             useCustomAlbumColor = true
@@ -397,7 +402,7 @@ struct ManualMetadataEditor: View {
         if let artworkData {
             updatedSong.artworkPreviewData = artworkData
         }
-        updatedSong.explicitRating = isExplicit ? 1 : 0
+        updatedSong.explicitRating = explicitRating
         updatedSong.customAlbumBackgroundColor = useCustomAlbumColor ? Self.hexString(from: customAlbumColor) : nil
 
         song = updatedSong

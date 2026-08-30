@@ -42,7 +42,7 @@ enum PairingFileImportError: LocalizedError {
 }
 
 
-private let BUILD_VERSION = "v2.4"
+private let BUILD_VERSION = "v2.5"
 private let DEVICE_HOST = "10.7.0.1"
 private let RP_PAIRING_PORT: UInt16 = 49152
 
@@ -142,7 +142,28 @@ class DeviceManager: ObservableObject {
     private var isReconnecting = false
     private var pendingReconnectCompletions: [(Bool) -> Void] = []
     private let reconnectCoordinationLock = NSLock()
-    nonisolated(unsafe) var artworkRepairCancelled: Bool = false
+    // A single shared `Bool` used to mean "cancel whatever repair is running" let one operation's
+    // leftover cancellation state silently abort a *different*, unrelated repair started later
+    // (e.g. cancel "Advanced Artwork & Metadata Fix", then "Fix Artwork" inherits the stale flag
+    // and immediately bails with "Repair cancelled" even though nobody cancelled it). A fresh
+    // token per operation fixes that: only `cancelCurrentRepairOperation()` can invalidate whatever
+    // operation is actually running right now, and starting a new one always gets a token nothing
+    // else can accidentally match.
+    nonisolated(unsafe) private var currentRepairOperationToken: UUID?
+
+    func beginRepairOperation() -> UUID {
+        let token = UUID()
+        currentRepairOperationToken = token
+        return token
+    }
+
+    func isRepairOperationCancelled(_ token: UUID) -> Bool {
+        currentRepairOperationToken != token
+    }
+
+    func cancelCurrentRepairOperation() {
+        currentRepairOperationToken = nil
+    }
     private var autoReconnectTimer: DispatchSourceTimer?
     private var lastHeartbeatAttemptStartedAt: Date = .distantPast
     private let autoReconnectCheckInterval: TimeInterval = 2
@@ -1564,20 +1585,26 @@ class DeviceManager: ObservableObject {
     }
     
     func runDatabaseRepairDoctor(progress: @escaping (String, Double?) -> Void, completion: @escaping (Bool, String) -> Void) {
+        let token = beginRepairOperation()
         progress("Connecting to device...", 0.05)
         startHeartbeat(forceReconnect: true) { success in
+            if self.isRepairOperationCancelled(token) {
+                completion(false, "Repair cancelled.")
+                return
+            }
             guard success else {
                 completion(false, "Connection failed. Please check pairing file.")
                 return
             }
-            
+
             DispatchQueue.global(qos: .userInitiated).async {
-                self.executeDatabaseRepairDoctor(progress: progress, completion: completion)
+                self.executeDatabaseRepairDoctor(operationToken: token, progress: progress, completion: completion)
             }
         }
     }
 
     func fixAlphabeticalOrdering(progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
+        let operationToken = beginRepairOperation()
         DispatchQueue.global(qos: .userInitiated).async {
             guard self.ensureActiveTransport(reason: "repairing alphabetical song ordering") else {
                 completion(false, "Device connection unavailable.")
@@ -1593,6 +1620,11 @@ class DeviceManager: ObservableObject {
                 return
             }
             defer { try? FileManager.default.removeItem(at: context.tempDir) }
+
+            if self.isRepairOperationCancelled(operationToken) {
+                completion(false, "Repair cancelled.")
+                return
+            }
 
             progress("Rebuilding alphabetical order...")
             var db: OpaquePointer?
@@ -1647,7 +1679,7 @@ class DeviceManager: ObservableObject {
         }
     }
     
-    private func executeDatabaseRepairDoctor(progress: @escaping (String, Double?) -> Void, completion: @escaping (Bool, String) -> Void) {
+    private func executeDatabaseRepairDoctor(operationToken: UUID, progress: @escaping (String, Double?) -> Void, completion: @escaping (Bool, String) -> Void) {
         progress("Creating database backup...", 0.1)
         
         let backupSem = DispatchSemaphore(value: 0)
@@ -1666,7 +1698,12 @@ class DeviceManager: ObservableObject {
             completion(false, "Backup failed: \(backupMsg). Aborting repair for safety.")
             return
         }
-        
+
+        if isRepairOperationCancelled(operationToken) {
+            completion(false, "Repair cancelled.")
+            return
+        }
+
         progress("Downloading library database...", 0.25)
         var dbData: Data?
         var walData: Data?
@@ -1753,7 +1790,12 @@ class DeviceManager: ObservableObject {
             completion(false, "Failed to parse database records.")
             return
         }
-        
+
+        if isRepairOperationCancelled(operationToken) {
+            completion(false, "Repair cancelled.")
+            return
+        }
+
         progress("Scanning device folders...", 0.5)
         var afc: AfcClientHandle?
         self.connectAfcClient(&afc)
@@ -1869,6 +1911,15 @@ class DeviceManager: ObservableObject {
             }
         }
         
+        if isRepairOperationCancelled(operationToken) {
+            completion(false, "Repair cancelled.")
+            return
+        }
+
+        // Past this point the repair starts actually deleting files and rewriting the database —
+        // no more cancellation checks beyond here, since bailing out mid-mutation would risk
+        // leaving the device in a half-repaired state (files removed but DB not yet updated to
+        // match, or vice versa).
         progress("Cleaning orphaned storage...", 0.75)
         var deletedOrphanAudio = 0
         for path in orphanedAudioPaths {
@@ -2855,6 +2906,29 @@ class DeviceManager: ObservableObject {
         case removeSong(containerPid: Int64, itemPid: Int64)
         case reorder(containerPid: Int64, orderedItemPids: [Int64])
         case addSongs(containerPid: Int64, itemPids: [Int64])
+        case setCoverArtwork(containerPid: Int64, imageData: Data)
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { bytes in
+            _ = CC_SHA256(bytes.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Matches the on-device convention (verified against a real playlist cover): the artwork
+    /// file's relative path is the SHA1 of its own artwork_token, split into a 2-char subfolder
+    /// and the remaining 38 chars as the filename — identical to how song artwork paths are
+    /// derived from their token elsewhere in this file.
+    private static func artworkRelativePath(fromToken token: String) -> String {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        let tokenData = Data(token.utf8)
+        tokenData.withUnsafeBytes { bytes in
+            _ = CC_SHA1(bytes.baseAddress, CC_LONG(tokenData.count), &hash)
+        }
+        let hashString = hash.map { String(format: "%02x", $0) }.joined()
+        return "\(hashString.prefix(2))/\(hashString.dropFirst(2))"
     }
 
     func applyPlaylistEdits(actions: [PlaylistAction], completion: @escaping (Bool, String) -> Void) {
@@ -2862,12 +2936,13 @@ class DeviceManager: ObservableObject {
             completion(false, "Failed to pull database from device.")
             return
         }
-        
+
         defer {
             try? FileManager.default.removeItem(at: staged.tempDir)
         }
-        
+
         var db: OpaquePointer?
+        var pendingCoverUploads: [(remotePath: String, imageData: Data)] = []
         if sqlite3_open(staged.dbURL.path, &db) == SQLITE_OK {
             do {
                 for action in actions {
@@ -2886,6 +2961,11 @@ class DeviceManager: ObservableObject {
                         try MediaLibraryBuilder.reorderSongsInPlaylist(db: db, containerPid: containerPid, orderedItemPids: orderedItemPids)
                     case .addSongs(let containerPid, let itemPids):
                         try MediaLibraryBuilder.addToPlaylist(db: db, containerPid: containerPid, songPids: itemPids)
+                    case .setCoverArtwork(let containerPid, let imageData):
+                        let artworkToken = Self.sha256Hex(imageData)
+                        let relativePath = Self.artworkRelativePath(fromToken: artworkToken)
+                        try MediaLibraryBuilder.setPlaylistCoverArtwork(db: db, containerPid: containerPid, artworkToken: artworkToken, relativePath: relativePath)
+                        pendingCoverUploads.append((remotePath: "/iTunes_Control/iTunes/Artwork/Originals/\(relativePath)", imageData: imageData))
                     }
                 }
                 sqlite3_close(db)
@@ -2898,7 +2978,28 @@ class DeviceManager: ObservableObject {
             completion(false, "Failed to open staged database.")
             return
         }
-        
+
+        if !pendingCoverUploads.isEmpty {
+            var afc: AfcClientHandle?
+            self.connectAfcClient(&afc)
+            guard let afc else {
+                completion(false, "Could not open AFC session to upload cover artwork.")
+                return
+            }
+            self.ensureRemoteDirectoryExists("/iTunes_Control/iTunes/Artwork/Originals", afc: afc)
+            var uploadFailed = false
+            for upload in pendingCoverUploads {
+                if !self.uploadDataToDevice(upload.imageData, remotePath: upload.remotePath, afc: afc, verify: false) {
+                    uploadFailed = true
+                }
+            }
+            afc_client_free(afc)
+            if uploadFailed {
+                completion(false, "Failed to upload cover artwork.")
+                return
+            }
+        }
+
         let success = commitStagedMediaLibrary(localDbURL: staged.dbURL)
         if success {
             self.stopHeartbeat()
@@ -3219,7 +3320,20 @@ class DeviceManager: ObservableObject {
         }
     }
 
-    func fetchExportablePlaylists(completion: @escaping ([(name: String, pid: Int64, songPids: [Int64])]) -> Void) {
+    func downloadPlaylistCoverArtwork(relativePath: String, completion: @escaping (Data?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureActiveTransport(reason: "loading playlist cover artwork") else {
+                completion(nil)
+                return
+            }
+            let remotePath = "/iTunes_Control/iTunes/Artwork/Originals/\(relativePath)"
+            self.downloadFileFromDevice(remotePath: remotePath) { data in
+                completion(data)
+            }
+        }
+    }
+
+    func fetchExportablePlaylists(completion: @escaping ([(name: String, pid: Int64, songPids: [Int64], coverRelativePath: String?)]) -> Void) {
         let semDb = DispatchSemaphore(value: 0)
         var dbData: Data?
         self.downloadFileFromDevice(remotePath: "/iTunes_Control/iTunes/MediaLibrary.sqlitedb") { data in
@@ -3244,7 +3358,7 @@ class DeviceManager: ObservableObject {
         }
         semShm.wait()
 
-        let playlists = withStagedMediaLibrary(dbData: dbData, walData: walData, shmData: shmData, label: "playlist_fetch") { stagedDbURL -> [(name: String, pid: Int64, songPids: [Int64])]? in
+        let playlists = withStagedMediaLibrary(dbData: dbData, walData: walData, shmData: shmData, label: "playlist_fetch") { stagedDbURL -> [(name: String, pid: Int64, songPids: [Int64], coverRelativePath: String?)]? in
             var db: OpaquePointer?
             guard sqlite3_open(stagedDbURL.path, &db) == SQLITE_OK else {
                 if db != nil { sqlite3_close(db) }
@@ -3252,16 +3366,16 @@ class DeviceManager: ObservableObject {
             }
             defer { sqlite3_close(db) }
 
-            var playlists: [(name: String, pid: Int64, songPids: [Int64])] = []
+            var playlists: [(name: String, pid: Int64, songPids: [Int64], coverRelativePath: String?)] = []
             let getPlaylistsQuery = "SELECT name, container_pid FROM container WHERE contained_media_type = 8 AND distinguished_kind = 0 ORDER BY name"
             var stmt: OpaquePointer?
-            
+
             if sqlite3_prepare_v2(db, getPlaylistsQuery, -1, &stmt, nil) == SQLITE_OK {
                 while sqlite3_step(stmt) == SQLITE_ROW {
                     guard let namePtr = sqlite3_column_text(stmt, 0) else { continue }
                     let name = String(cString: namePtr)
                     let pid = sqlite3_column_int64(stmt, 1)
-                    
+
                     var pids: [Int64] = []
                     let getPidsQuery = "SELECT item_pid FROM container_item WHERE container_pid = ? ORDER BY position ASC"
                     var pidStmt: OpaquePointer?
@@ -3272,7 +3386,26 @@ class DeviceManager: ObservableObject {
                         }
                     }
                     sqlite3_finalize(pidStmt)
-                    playlists.append((name, pid, pids))
+
+                    var coverRelativePath: String?
+                    let coverQuery = """
+                    SELECT ar.relative_path FROM artwork_token at
+                    JOIN artwork ar ON ar.artwork_token = at.artwork_token
+                        AND ar.artwork_source_type = at.artwork_source_type
+                        AND ar.artwork_variant_type = at.artwork_variant_type
+                    WHERE at.entity_pid = ? AND at.entity_type = 1 AND at.artwork_type = 5
+                    LIMIT 1
+                    """
+                    var coverStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, coverQuery, -1, &coverStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_int64(coverStmt, 1, pid)
+                        if sqlite3_step(coverStmt) == SQLITE_ROW, let pathPtr = sqlite3_column_text(coverStmt, 0) {
+                            coverRelativePath = String(cString: pathPtr)
+                        }
+                    }
+                    sqlite3_finalize(coverStmt)
+
+                    playlists.append((name, pid, pids, coverRelativePath))
                 }
             }
             sqlite3_finalize(stmt)
@@ -3862,16 +3995,27 @@ class DeviceManager: ObservableObject {
                 return
             }
 
+            var artworkUploadAttempted = false
+            var artworkUploadFailureCount = 0
             if let artworkData, !artworkData.isEmpty {
+                artworkUploadAttempted = true
                 var afc: AfcClientHandle?
                 self.connectAfcClient(&afc)
                 if let afc {
                     for original in originals {
                         guard let relativePath = original.artworkRelativePath, !relativePath.isEmpty else { continue }
                         let remoteArtworkPath = "/iTunes_Control/iTunes/Artwork/Originals/\(relativePath)"
-                        _ = self.uploadDataToDevice(artworkData, remotePath: remoteArtworkPath, afc: afc, verify: false)
+                        if !self.uploadDataToDevice(artworkData, remotePath: remoteArtworkPath, afc: afc, verify: false) {
+                            artworkUploadFailureCount += 1
+                        }
                     }
                     afc_client_free(afc)
+                } else {
+                    Logger.shared.log("[DeviceManager] updateExportableSongsMetadata: could not open AFC session to upload artwork")
+                    artworkUploadFailureCount = originals.count
+                }
+                if artworkUploadFailureCount > 0 {
+                    Logger.shared.log("[DeviceManager] updateExportableSongsMetadata: artwork upload failed for \(artworkUploadFailureCount) of \(originals.count) song(s)")
                 }
             }
 
@@ -3880,7 +4024,12 @@ class DeviceManager: ObservableObject {
                 return
             }
 
-            completion(true, "Updated metadata for \(originals.count) song\(originals.count == 1 ? "" : "s").")
+            let songCountText = "\(originals.count) song\(originals.count == 1 ? "" : "s")"
+            if artworkUploadAttempted && artworkUploadFailureCount > 0 {
+                completion(true, "Updated metadata for \(songCountText), but artwork failed to upload for \(artworkUploadFailureCount) of them.")
+            } else {
+                completion(true, "Updated metadata for \(songCountText).")
+            }
         }
     }
 
@@ -4109,14 +4258,19 @@ class DeviceManager: ObservableObject {
             return
         }
 
+        let token = beginRepairOperation()
         let startRepair = {
-            self.runIOS26ArtworkRepair(progress: progress, completion: completion)
+            self.runIOS26ArtworkRepair(token: token, progress: progress, completion: completion)
         }
 
         if heartbeatReady && hasActiveTransport {
             startRepair()
         } else {
             startHeartbeat { connected in
+                if self.isRepairOperationCancelled(token) {
+                    completion(false, "Repair cancelled.")
+                    return
+                }
                 guard connected else {
                     completion(false, "Could not connect to the device.")
                     return
@@ -4132,18 +4286,17 @@ class DeviceManager: ObservableObject {
             return
         }
 
-        artworkRepairCancelled = false
+        let token = beginRepairOperation()
 
         let startRepair = {
-            self.runExperimentalAlbumArtworkPointerRepair(progress: progress, completion: completion)
+            self.runExperimentalAlbumArtworkPointerRepair(token: token, progress: progress, completion: completion)
         }
 
         if heartbeatReady && hasActiveTransport {
             startRepair()
         } else {
             startHeartbeat { connected in
-                if self.artworkRepairCancelled {
-                    self.artworkRepairCancelled = false
+                if self.isRepairOperationCancelled(token) {
                     completion(false, "Repair cancelled.")
                     return
                 }
@@ -4156,7 +4309,7 @@ class DeviceManager: ObservableObject {
         }
     }
 
-    private func runIOS26ArtworkRepair(progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
+    private func runIOS26ArtworkRepair(token: UUID, progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             if self.killMusicBeforeInjectEnabled {
                 let killed = self.terminateMusicAppIfRunning()
@@ -4232,8 +4385,7 @@ class DeviceManager: ObservableObject {
 
             Logger.shared.log("[ArtworkRepair] Found \(candidates.count) artwork candidates")
 
-            if self.artworkRepairCancelled {
-                self.artworkRepairCancelled = false
+            if self.isRepairOperationCancelled(token) {
                 try? FileManager.default.removeItem(at: tempDir)
                 completion(false, "Repair cancelled.")
                 return
@@ -4244,8 +4396,7 @@ class DeviceManager: ObservableObject {
                 var colorCache: [Int64: String] = [:]
 
                 for (index, candidate) in candidates.enumerated() {
-                    if self.artworkRepairCancelled {
-                        self.artworkRepairCancelled = false
+                    if self.isRepairOperationCancelled(token) {
                         try? FileManager.default.removeItem(at: tempDir)
                         completion(false, "Repair cancelled.")
                         return
@@ -4299,7 +4450,7 @@ class DeviceManager: ObservableObject {
         }
     }
 
-    private func runExperimentalAlbumArtworkPointerRepair(progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
+    private func runExperimentalAlbumArtworkPointerRepair(token: UUID, progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             if self.killMusicBeforeInjectEnabled {
                 let killed = self.terminateMusicAppIfRunning()
@@ -4375,8 +4526,7 @@ class DeviceManager: ObservableObject {
 
             Logger.shared.log("[AlbumArtworkRepair] Found \(candidates.count) song candidates for metadata refresh")
 
-            if self.artworkRepairCancelled {
-                self.artworkRepairCancelled = false
+            if self.isRepairOperationCancelled(token) {
                 try? FileManager.default.removeItem(at: tempDir)
                 completion(false, "Repair cancelled.")
                 return
@@ -4386,8 +4536,7 @@ class DeviceManager: ObservableObject {
                 var repairs: [ExperimentalAppleMetadataRepair] = []
 
                 for (index, candidate) in candidates.enumerated() {
-                    if self.artworkRepairCancelled {
-                        self.artworkRepairCancelled = false
+                    if self.isRepairOperationCancelled(token) {
                         completion(false, "Repair cancelled.")
                         return
                     }

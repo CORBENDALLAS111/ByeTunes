@@ -34,6 +34,7 @@ struct DeviceLibraryBrowserView: View {
         var name: String
         let pid: Int64
         var songs: [DeviceManager.ExportableSongInfo]
+        var coverImage: UIImage? = nil
         var id: Int64 { pid }
     }
 
@@ -53,8 +54,8 @@ struct DeviceLibraryBrowserView: View {
     @State private var playlists: [PlaylistEntry] = []
     @State private var isSyncingPlaylists = false
     @State private var showingNewPlaylistPrompt = false
+    @State private var showingSmartPlaylistBuilder = false
     @State private var showingAddToPlaylistSheet = false
-    @State private var newPlaylistName = ""
     @State private var showingRenamePlaylistPrompt = false
     @State private var renamePlaylistPid: Int64? = nil
     @State private var renamePlaylistText = ""
@@ -154,12 +155,12 @@ struct DeviceLibraryBrowserView: View {
     // Splits a collab credit like "Alex Rose & Casper Magico" into ["Alex Rose", "Casper Magico"]
     // so each performer gets their own Artists row instead of one row per unique credit string.
     // This intentionally causes the same song to show up under every artist it credits.
-    private static let artistSplitRegex = try! NSRegularExpression(
+    static let artistSplitRegex = try! NSRegularExpression(
         pattern: #"\s*(?:,|&|/|\bfeat\.?|\bft\.?|\bfeaturing\b|\bvs\.?|\bx\b|\by\b)\s*"#,
         options: [.caseInsensitive]
     )
 
-    private static func splitArtistNames(_ raw: String) -> [String] {
+    static func splitArtistNames(_ raw: String) -> [String] {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
@@ -1277,7 +1278,7 @@ struct DeviceLibraryBrowserView: View {
         cachedAlbumEntries = computeAlbumEntries()
     }
 
-    private func refreshSongs() {
+    private func refreshSongs(completion: (() -> Void)? = nil) {
         isLoading = true
         statusMessage = ""
         manager.fetchExportableSongs { result in
@@ -1288,7 +1289,7 @@ struct DeviceLibraryBrowserView: View {
                 if result.isEmpty {
                     isSelectionMode = false
                 }
-                
+
                 manager.fetchExportablePlaylists { pList in
                     DispatchQueue.main.async {
                         print("[Playlist Debug] Fetched playlists: \(pList)")
@@ -1305,26 +1306,57 @@ struct DeviceLibraryBrowserView: View {
                         queuedArtworkIDs.removeAll()
                         artworkLoadingIDs.removeAll()
                         prefetchArtworkForCurrentMode()
+                        loadPlaylistCovers(for: pList)
+                        completion?()
                     }
                 }
             }
         }
     }
-    
+
+    private func loadPlaylistCovers(for pList: [(name: String, pid: Int64, songPids: [Int64], coverRelativePath: String?)]) {
+        for p in pList {
+            guard let relativePath = p.coverRelativePath else { continue }
+            manager.downloadPlaylistCoverArtwork(relativePath: relativePath) { data in
+                guard let data, let image = UIImage(data: data) else { return }
+                DispatchQueue.main.async {
+                    if let idx = playlists.firstIndex(where: { $0.pid == p.pid }) {
+                        playlists[idx].coverImage = image
+                    }
+                }
+            }
+        }
+    }
+
     private func playlistRowContent(_ playlist: PlaylistEntry) -> some View {
         HStack(spacing: 16) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color(.tertiarySystemGroupedBackground))
                     .frame(width: 48, height: 48)
-                Image(systemName: "music.note.list")
-                    .font(.title3)
-                    .foregroundStyle(mutedTextColor)
+                if let cover = playlist.coverImage {
+                    Image(uiImage: cover)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Image(systemName: "music.note.list")
+                        .font(.title3)
+                        .foregroundStyle(mutedTextColor)
+                }
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(playlist.name)
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(strongTextColor)
+                HStack(spacing: 6) {
+                    Text(playlist.name)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(strongTextColor)
+                    if SmartPlaylistStore.record(forPid: playlist.pid) != nil {
+                        Image(systemName: "wand.and.stars")
+                            .font(.caption)
+                            .foregroundStyle(Color(red: 1.0, green: 0.27, blue: 0.42))
+                    }
+                }
                 Text("\(playlist.songs.count) songs")
                     .font(.subheadline)
                     .foregroundStyle(mutedTextColor)
@@ -1365,9 +1397,26 @@ struct DeviceLibraryBrowserView: View {
                 .padding(.vertical, 14)
             }
             .buttonStyle(.plain)
-            
+
             Divider().overlay(hairlineColor).padding(.leading, 64)
-            
+
+            Button {
+                showingSmartPlaylistBuilder = true
+            } label: {
+                HStack {
+                    Image(systemName: "wand.and.stars")
+                        .font(.title2)
+                        .foregroundStyle(Color.accentColor)
+                    Text("New Smart Playlist")
+                        .font(.headline)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(.plain)
+
+            Divider().overlay(hairlineColor).padding(.leading, 64)
+
             ForEach(playlists) { playlist in
                 Group {
                     if isSelectionMode {
@@ -1383,6 +1432,13 @@ struct DeviceLibraryBrowserView: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            if SmartPlaylistStore.record(forPid: playlist.pid) != nil {
+                                Button {
+                                    refreshSmartPlaylist(playlist)
+                                } label: {
+                                    Label("Refresh Smart Playlist", systemImage: "arrow.triangle.2.circlepath")
+                                }
+                            }
                             Button(role: .destructive) {
                                 applyPlaylistActions([.delete(containerPid: playlist.pid)])
                             } label: {
@@ -1398,19 +1454,47 @@ struct DeviceLibraryBrowserView: View {
             }
         }
         .padding(.horizontal)
-        .alert("New Playlist", isPresented: $showingNewPlaylistPrompt) {
-            TextField("Name", text: $newPlaylistName)
-            Button("Cancel", role: .cancel) { newPlaylistName = "" }
-            Button("Create") {
-                if !newPlaylistName.isEmpty {
-                    applyPlaylistActions([.create(name: newPlaylistName)])
-                    newPlaylistName = ""
+        .sheet(isPresented: $showingNewPlaylistPrompt) {
+            PlaylistNamingView(title: "New Playlist", icon: "music.note.list", iconTint: Color(red: 1.0, green: 0.27, blue: 0.42)) { name, coverImageData in
+                guard !name.isEmpty else { return }
+                applyPlaylistActions([.create(name: name)]) {
+                    if let coverImageData, let matched = playlists.first(where: { $0.name == name }) {
+                        applyPlaylistActions([.setCoverArtwork(containerPid: matched.pid, imageData: coverImageData)])
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showingSmartPlaylistBuilder) {
+            SmartPlaylistBuilderView(songs: songs) { name, songPids, rule, coverImageData in
+                applyPlaylistActions([.createWithSongs(name: name, songPids: songPids)]) {
+                    guard let matched = playlists.first(where: { $0.name == name }) else { return }
+                    SmartPlaylistStore.save(SmartPlaylistRecord(name: matched.name, containerPid: matched.pid, rule: rule))
+                    if let coverImageData {
+                        applyPlaylistActions([.setCoverArtwork(containerPid: matched.pid, imageData: coverImageData)])
+                    }
                 }
             }
         }
     }
-    
-    private func applyPlaylistActions(_ actions: [DeviceManager.PlaylistAction]) {
+
+    private func refreshSmartPlaylist(_ playlist: PlaylistEntry) {
+        guard let record = SmartPlaylistStore.record(forPid: playlist.pid) else { return }
+        let matchingPids = Set(record.rule.matchingSongs(in: songs).map(\.itemPid))
+        let currentPids = Set(playlist.songs.map(\.itemPid))
+        guard matchingPids != currentPids else { return }
+
+        var actions: [DeviceManager.PlaylistAction] = []
+        let toAdd = Array(matchingPids.subtracting(currentPids))
+        if !toAdd.isEmpty {
+            actions.append(.addSongs(containerPid: playlist.pid, itemPids: toAdd))
+        }
+        for pid in currentPids.subtracting(matchingPids) {
+            actions.append(.removeSong(containerPid: playlist.pid, itemPid: pid))
+        }
+        applyPlaylistActions(actions)
+    }
+
+    private func applyPlaylistActions(_ actions: [DeviceManager.PlaylistAction], onSynced: (() -> Void)? = nil) {
         guard !actions.isEmpty else { return }
 
         for action in actions {
@@ -1424,6 +1508,7 @@ struct DeviceLibraryBrowserView: View {
                 playlists.append(PlaylistEntry(name: name, pid: newId, songs: newSongs))
             case .delete(let containerPid):
                 playlists.removeAll { $0.pid == containerPid }
+                SmartPlaylistStore.remove(forPid: containerPid)
             case .rename(let containerPid, let newName):
                 if let idx = playlists.firstIndex(where: { $0.pid == containerPid }) {
                     playlists[idx].name = newName
@@ -1446,6 +1531,10 @@ struct DeviceLibraryBrowserView: View {
                     let newSongs = itemPids.compactMap { pid in songs.first(where: { $0.itemPid == pid }) }
                     playlists[idx].songs.append(contentsOf: newSongs)
                 }
+            case .setCoverArtwork(let containerPid, let imageData):
+                if let idx = playlists.firstIndex(where: { $0.pid == containerPid }) {
+                    playlists[idx].coverImage = UIImage(data: imageData)
+                }
             }
         }
         
@@ -1454,7 +1543,9 @@ struct DeviceLibraryBrowserView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 isSyncingPlaylists = false
                 if success {
-                    refreshSongs()
+                    refreshSongs {
+                        onSynced?()
+                    }
                 } else {
                     statusMessage = "Sync failed: \(error)"
                 }

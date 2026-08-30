@@ -1049,7 +1049,7 @@ struct MusicView: View {
         injectProgress = 0
         totalInjectCount = songs.count
         currentInjectIndex = 0
-        isMinimalBatchInjectionMode = songs.filter { SongMetadata.shouldPreserveLocalFile($0.localURL) }.count >= Self.largeBatchThreshold
+        isMinimalBatchInjectionMode = songs.count >= Self.largeBatchThreshold
         
         
         manager.startHeartbeat(forceReconnect: true) { success in
@@ -1116,12 +1116,22 @@ struct MusicView: View {
                                 try? FileManager.default.removeItem(at: song.localURL)
                             }
                         }
-                        
+
                         self.showToast(title: "Injection Complete", icon: "checkmark.circle.fill")
                         withAnimation {
                             self.songs.removeAll()
                         }
                     } else {
+                        // Progress ticking past a song already trimmed it from the visible queue
+                        // above, but a false completion means the on-device library commit never
+                        // actually landed — those songs were never confirmed injected, so put them
+                        // back instead of letting them silently vanish with no way to retry.
+                        if lastProcessedIndex > 0 {
+                            let unconfirmedSongs = Array(songsToInfect.prefix(lastProcessedIndex))
+                            withAnimation {
+                                self.songs.insert(contentsOf: unconfirmedSongs, at: 0)
+                            }
+                        }
                         self.showToast(title: "Injection Failed", icon: "xmark.circle.fill")
                     }
                 }
@@ -1557,7 +1567,7 @@ struct MusicView: View {
         injectProgress = 0
         totalInjectCount = songs.count
         currentInjectIndex = 0
-        isMinimalBatchInjectionMode = songs.filter { SongMetadata.shouldPreserveLocalFile($0.localURL) }.count >= Self.largeBatchThreshold
+        isMinimalBatchInjectionMode = songs.count >= Self.largeBatchThreshold
 
         
         
@@ -1627,6 +1637,14 @@ struct MusicView: View {
                             self.songs.removeAll()
                         }
                     } else {
+                        // See startInjectionProcess() — progress-trimmed songs aren't confirmed
+                        // injected just because a false completion arrived, so put them back.
+                        if lastProcessedIndex > 0 {
+                            let unconfirmedSongs = Array(songsToInfect.prefix(lastProcessedIndex))
+                            withAnimation {
+                                self.songs.insert(contentsOf: unconfirmedSongs, at: 0)
+                            }
+                        }
                         self.showToast(title: "Playlist Failed", icon: "xmark.circle.fill")
                     }
                 }

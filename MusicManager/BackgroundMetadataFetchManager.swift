@@ -228,8 +228,33 @@ final class BackgroundMetadataFetchManager: ObservableObject {
 
     private func appendReadySong(_ song: SongMetadata) {
         var persisted = load([PersistedSong].self, forKey: Self.readySongsKey) ?? []
+
+        // Appending to this list and removing the source item from the pending-imports list are
+        // two separate persisted writes with no way to make them a single atomic transaction — if
+        // the process is killed by the OS in between (routine for a background task), the item
+        // stays pending and gets re-enriched (and re-persisted, if "Keep Downloaded Songs" is on,
+        // as a second physical copy) on the next launch. Rather than risk losing the download
+        // entirely by reordering these two writes, guard here instead: skip appending a second
+        // ready-song entry that's already sitting un-drained with the same identity, so a re-run
+        // doesn't pile up duplicates waiting to be imported.
+        let duplicateSignature = Self.duplicateSignature(title: song.title, artist: song.artist, album: song.album)
+        guard !persisted.contains(where: { Self.duplicateSignature(title: $0.title, artist: $0.artist, album: $0.album) == duplicateSignature }) else {
+            log("Skipping duplicate ready-song append for \(song.title) — an un-drained entry already matches.")
+            return
+        }
+
         persisted.append(PersistedSong(song: song))
         save(persisted, forKey: Self.readySongsKey)
+    }
+
+    private static func duplicateSignature(title: String, artist: String, album: String) -> String {
+        func normalize(_ value: String) -> String {
+            value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        }
+        return "\(normalize(title))|\(normalize(artist))|\(normalize(album))"
     }
 
     private func removePendingImport(_ item: PersistedPendingDownloadedImport) {

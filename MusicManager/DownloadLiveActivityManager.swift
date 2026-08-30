@@ -46,6 +46,11 @@ final class DownloadLiveActivityManager {
         guard #available(iOS 16.2, *) else { return }
         DownloadLiveActivityRuntime.shared.clear()
     }
+
+    func reconcileOrphanedActivitiesOnLaunch() {
+        guard #available(iOS 16.2, *) else { return }
+        DownloadLiveActivityRuntime.shared.reconcileOrphanedActivitiesOnLaunch()
+    }
 }
 
 #if canImport(ActivityKit)
@@ -93,10 +98,16 @@ private final class DownloadLiveActivityRuntime {
             phase: phase
         )
 
+        let outstandingUpdate = updateTask
+        updateTask = nil
+        pendingState = nil
+        outstandingUpdate?.cancel()
+
         Task {
-            updateTask?.cancel()
-            updateTask = nil
-            pendingState = nil
+            // Cancelling doesn't stop a task already mid-`await applyUpdate(...)` —
+            // waiting for it here keeps a stale in-flight update from landing on the
+            // activity after we've already told it to end.
+            await outstandingUpdate?.value
             lastState = state
             let activity = currentActivity ?? Activity<DownloadLiveActivityAttributes>.activities.first
             currentActivity = nil
@@ -109,13 +120,27 @@ private final class DownloadLiveActivityRuntime {
     }
 
     func clear() {
+        let outstandingUpdate = updateTask
+        updateTask = nil
+        pendingState = nil
+        lastState = nil
+        outstandingUpdate?.cancel()
+        currentActivity = nil
+
+        Task {
+            await outstandingUpdate?.value
+            let activities = Activity<DownloadLiveActivityAttributes>.activities
+            for activity in activities {
+                await activity.end(nil, dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    func reconcileOrphanedActivitiesOnLaunch() {
         Task {
             let activities = Activity<DownloadLiveActivityAttributes>.activities
-            currentActivity = nil
-            updateTask?.cancel()
-            updateTask = nil
-            pendingState = nil
-            lastState = nil
+            guard !activities.isEmpty else { return }
+            Logger.shared.log("[DownloadLiveActivity] Cold launch found \(activities.count) leftover activity(ies) from a previous session — ending them.")
             for activity in activities {
                 await activity.end(nil, dismissalPolicy: .immediate)
             }

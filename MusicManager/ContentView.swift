@@ -13,7 +13,7 @@ struct AppUpdateInfo: Identifiable, Equatable {
 }
 
 enum AppUpdateChecker {
-    static let currentVersion = "2.4"
+    static let currentVersion = "2.5"
     static let releasesURL = URL(string: "https://github.com/EduAlexxis/ByeTunes/releases")!
 
     private struct GitHubRelease: Decodable {
@@ -106,6 +106,12 @@ struct ContentView: View {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         return version.majorVersion >= 26
     }
+
+    private var downloadTabIndex: Int {
+        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        let showRingtonesTab = (16...18).contains(major)
+        return showRingtonesTab ? 2 : 1
+    }
     
     var body: some View {
         ZStack {
@@ -153,7 +159,7 @@ struct ContentView: View {
                     isComplete: $tutorialComplete,
                     songs: $songs,
                     selectedTab: $selectedTab,
-                    downloadTabIndex: isIOS26OrLater ? 1 : 1
+                    downloadTabIndex: downloadTabIndex
                 )
                 .zIndex(1)
             }
@@ -203,7 +209,8 @@ struct ContentView: View {
         }
         .onAppear {
             cleanupLegacyImportedAudioFiles()
-            
+            DownloadLiveActivityManager.shared.reconcileOrphanedActivitiesOnLaunch()
+
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                 withAnimation(.easeOut(duration: 0.5)) {
                     showSplash = false
@@ -223,7 +230,7 @@ struct ContentView: View {
             if url.scheme?.lowercased() == "byetunes" {
                 let host = (url.host ?? "").lowercased()
                 if host == "download" {
-                    selectedTab = isIOS26OrLater ? 1 : 1
+                    selectedTab = downloadTabIndex
                     return
                 }
             }
@@ -231,9 +238,6 @@ struct ContentView: View {
             let host = (url.host ?? "").lowercased()
             if host.contains("spotify.com") || host.contains("music.apple.com") {
                 if let normalized = LinkNormalizer.normalize(url) {
-                    let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
-                    let showRingtonesTab = (16...18).contains(major)
-                    let downloadTabIndex = showRingtonesTab ? 2 : 1
                     self.selectedTab = downloadTabIndex
                     NotificationCenter.default.post(name: NSNotification.Name("IncomingMusicLink"), object: normalized.normalizedURL.absoluteString)
                 }
@@ -241,9 +245,6 @@ struct ContentView: View {
             }
 
             if host.contains("deezer.com") || host.contains("deezer.page.link") {
-                let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
-                let showRingtonesTab = (16...18).contains(major)
-                let downloadTabIndex = showRingtonesTab ? 2 : 1
                 self.selectedTab = downloadTabIndex
                 NotificationCenter.default.post(name: NSNotification.Name("IncomingMusicLink"), object: url.absoluteString)
                 return

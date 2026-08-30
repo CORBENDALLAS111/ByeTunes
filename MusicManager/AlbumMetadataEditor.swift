@@ -11,7 +11,7 @@ struct AlbumMetadataEditor: View {
     @State private var artist: String = ""
     @State private var genre: String = ""
     @State private var year: String = ""
-    @State private var isExplicit: Bool = false
+    @State private var explicitRatingChoice: ExplicitRatingChoice = .keepAsIs
 
     @State private var artworkItem: PhotosPickerItem?
     @State private var artworkData: Data?
@@ -20,6 +20,27 @@ struct AlbumMetadataEditor: View {
 
     private enum Field {
         case albumName, artist, genre, year
+    }
+
+    // content_rating is a 3-state field on device (0 = none, 1 = explicit, 2 = clean), not a
+    // boolean — a plain on/off toggle here can only ever write 0 or 1, so saving with it (even
+    // without touching it) silently turns every "clean" track in the album into "explicit". Keep
+    // As-Is passes `nil` through to `onSave`, which the backend already treats as "leave each
+    // track's own rating untouched" — it just never had a way to be selected from this screen.
+    private enum ExplicitRatingChoice: Int, CaseIterable {
+        case keepAsIs = -1
+        case none = 0
+        case explicit = 1
+        case clean = 2
+
+        var label: String {
+            switch self {
+            case .keepAsIs: return "Keep As-Is"
+            case .none: return "None"
+            case .explicit: return "Explicit"
+            case .clean: return "Clean"
+            }
+        }
     }
 
     var body: some View {
@@ -103,20 +124,22 @@ struct AlbumMetadataEditor: View {
                     }
                     .padding(.vertical, 4)
 
-                    Toggle(isOn: $isExplicit) {
-                        HStack(spacing: 8) {
-                            Text("🅴")
-                                .font(.caption.weight(.black))
-                                .foregroundColor(.red)
-                            Text("Explicit")
-                                .font(.body)
+                    HStack {
+                        Text("Content Rating")
+                        Spacer()
+                        Picker("", selection: $explicitRatingChoice) {
+                            ForEach(ExplicitRatingChoice.allCases, id: \.self) { choice in
+                                Text(choice.label).tag(choice)
+                            }
                         }
+                        .pickerStyle(.menu)
+                        .tint(.secondary)
                     }
                     .padding(.vertical, 4)
                 } header: {
                     Text("Details")
                 } footer: {
-                    Text("These changes apply to every track in the album at once.")
+                    Text("These changes apply to every track in the album at once. \"Keep As-Is\" leaves each track's own content rating untouched.")
                 }
             }
             .navigationTitle("Edit Album")
@@ -160,14 +183,18 @@ struct AlbumMetadataEditor: View {
         genre = album.songs.first?.genre ?? ""
         let representativeYear = album.songs.first(where: { $0.year > 0 })?.year ?? 0
         year = representativeYear > 0 ? String(representativeYear) : ""
-        isExplicit = album.songs.contains { $0.explicitRating > 0 }
+        let ratings = Set(album.songs.map(\.explicitRating))
+        explicitRatingChoice = ratings.count == 1
+            ? (ratings.first.flatMap(ExplicitRatingChoice.init(rawValue:)) ?? .keepAsIs)
+            : .keepAsIs
         artworkData = initialArtworkData
     }
 
     private func saveChanges() {
         let trimmedYear = year.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedYear = Int(trimmedYear) ?? 0
-        onSave(artist, albumName, genre, resolvedYear, artworkData, isExplicit ? 1 : 0)
+        let explicitRating = explicitRatingChoice == .keepAsIs ? nil : explicitRatingChoice.rawValue
+        onSave(artist, albumName, genre, resolvedYear, artworkData, explicitRating)
         isPresented = false
     }
 }

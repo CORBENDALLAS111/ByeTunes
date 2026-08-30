@@ -19,7 +19,7 @@ struct TutorialOverlayView: View {
     @AppStorage("appleRichMetadata") private var appleRichMetadata = true
     @AppStorage("autofetchMetadata") private var autofetchMetadata  = true
     @AppStorage("fetchLyrics")       private var fetchLyrics        = false
-    @AppStorage("metadataSource")    private var metadataSource     = "local"
+    @AppStorage("metadataSource")    private var metadataSource     = "apple"
 
     var body: some View {
         ZStack(alignment: .bottom) {

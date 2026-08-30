@@ -23,7 +23,7 @@ struct SettingsView: View {
     @State private var toastTitle = ""
     @State private var toastIcon = ""
 
-    @AppStorage("metadataSource") private var metadataSource = "local"
+    @AppStorage("metadataSource") private var metadataSource = "apple"
     @AppStorage("autofetchMetadata") private var autofetchMetadata = true
     @AppStorage("keepLocalMetadataForLocalFiles") private var keepLocalMetadataForLocalFiles = false
     @AppStorage("fetchLyrics") private var fetchLyrics = false
@@ -34,7 +34,7 @@ struct SettingsView: View {
     @AppStorage("backgroundDownloadsEnabled") private var backgroundDownloadsEnabled = false
     @AppStorage("backgroundMetadataFetchEnabled") private var backgroundMetadataFetchEnabled = true
     @AppStorage("downloadLiveActivitiesEnabled") private var downloadLiveActivitiesEnabled = true
-    @AppStorage("downloadSearchProvider") private var downloadSearchProvider = DownloadSearchProviderOption.appleMusic.rawValue
+    @AppStorage("downloadSearchProvider") private var downloadSearchProvider = DownloadSearchProviderOption.deezer.rawValue
     @AppStorage("yoinkifyFormat") private var yoinkifyFormat = "flac"
 
     var body: some View {

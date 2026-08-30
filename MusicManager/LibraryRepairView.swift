@@ -296,13 +296,14 @@ struct LibraryRepairView: View {
                 .zIndex(100)
             }
 
-            if isFixingArtwork || isRebuildingAlbumArtwork || isRunningRepairDoctor {
+            if isFixingArtwork || isRebuildingAlbumArtwork || isRunningRepairDoctor || isFixingAlphabeticalOrder {
                 artworkFixPopup
                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
             }
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isFixingArtwork)
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isRebuildingAlbumArtwork)
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isFixingAlphabeticalOrder)
         .navigationTitle("Library Repair")
         .navigationBarTitleDisplayMode(.inline)
         .alert(infoAlertTitle, isPresented: $showingInfoAlert) {
@@ -323,13 +324,13 @@ struct LibraryRepairView: View {
                         .fill(Color.accentColor.opacity(0.12))
                         .frame(width: 58, height: 58)
 
-                    Image(systemName: isRunningRepairDoctor ? "heart.text.square" : (isExperimentalArtworkRefreshActive ? "wand.and.stars" : "photo.on.rectangle.angled"))
+                    Image(systemName: isRunningRepairDoctor ? "heart.text.square" : (isFixingAlphabeticalOrder ? "textformat.abc.dottedunderline" : (isExperimentalArtworkRefreshActive ? "wand.and.stars" : "photo.on.rectangle.angled")))
                         .font(.system(size: 25, weight: .semibold))
                         .foregroundColor(.accentColor)
                 }
 
                 VStack(spacing: 6) {
-                    Text(isRunningRepairDoctor ? "Clean & Repair Library" : (isExperimentalArtworkRefreshActive ? "Refreshing Metadata & Artwork" : "Fixing Artwork"))
+                    Text(isRunningRepairDoctor ? "Clean & Repair Library" : (isFixingAlphabeticalOrder ? "Fix Alphabetical Order" : (isExperimentalArtworkRefreshActive ? "Refreshing Metadata & Artwork" : "Fixing Artwork")))
                         .font(.headline)
                         .foregroundColor(.primary)
 
@@ -356,10 +357,14 @@ struct LibraryRepairView: View {
                 }
 
                 Button {
-                    manager.artworkRepairCancelled = true
-                    isRebuildingAlbumArtwork = false
-                    isFixingArtwork = false
-                    isRunningRepairDoctor = false
+                    // Don't flip the `isFixing.../isRunning...` flags here — that's what drives
+                    // this popup's own visibility, so doing it in the same action that sets
+                    // "Cancelling..." made the popup disappear before that text ever rendered.
+                    // These blocking AFC/SQL operations can only notice cancellation between
+                    // steps, not mid-call, so leave the popup up with "Cancelling..." until each
+                    // operation's own completion handler actually confirms it stopped and clears
+                    // its own flag.
+                    manager.cancelCurrentRepairOperation()
                     artworkFixMessage = "Cancelling..."
                 } label: {
                     Text("Cancel")
@@ -438,6 +443,7 @@ struct LibraryRepairView: View {
         } completion: { success, message in
             DispatchQueue.main.async {
                 self.isRunningRepairDoctor = false
+                guard !message.lowercased().contains("cancel") else { return }
                 if success {
                     self.showToastMessage(title: "Library Repaired!", icon: "shield.checkmark.fill")
                 } else {
@@ -458,6 +464,7 @@ struct LibraryRepairView: View {
         } completion: { success, message in
             DispatchQueue.main.async {
                 self.isFixingAlphabeticalOrder = false
+                guard !message.lowercased().contains("cancel") else { return }
                 self.showToastMessage(
                     title: success ? message : "Alphabetical Fix Failed: \(message)",
                     icon: success ? "textformat.abc.dottedunderline" : "exclamationmark.triangle.fill"

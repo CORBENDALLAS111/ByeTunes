@@ -1101,7 +1101,7 @@ struct SongMetadata: Identifiable {
         guard let url = URL(string: urlString) else { return nil }
         
         var request = URLRequest(url: url)
-        request.setValue("ByeTunes/2.4 (https://github.com/EduAlexxis/ByeTunes)", forHTTPHeaderField: "User-Agent")
+        request.setValue("ByeTunes/2.5 (https://github.com/EduAlexxis/ByeTunes)", forHTTPHeaderField: "User-Agent")
         
         do {
             let (data, response) = try await SongMetadataNetworking.data(for: request)
@@ -1753,7 +1753,7 @@ extension SongMetadata {
         guard let url = URL(string: "https://lrclib.net/api/search?q=\(encodedQuery)") else { return [] }
         
         var request = URLRequest(url: url)
-        request.setValue("ByeTunes/2.4 (https://github.com/EduAlexxis/ByeTunes)", forHTTPHeaderField: "User-Agent")
+        request.setValue("ByeTunes/2.5 (https://github.com/EduAlexxis/ByeTunes)", forHTTPHeaderField: "User-Agent")
         
         do {
             let (data, response) = try await SongMetadataNetworking.data(for: request)
@@ -2228,7 +2228,7 @@ extension SongMetadata {
                 song = await enrichWithAppleMusicMetadata(song)
             }
         } else {
-            let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "local"
+            let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "apple"
             let autofetch = UserDefaults.standard.bool(forKey: "autofetchMetadata")
 
             if metadataSource == "apple" && autofetch {

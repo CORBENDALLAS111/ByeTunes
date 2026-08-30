@@ -109,7 +109,8 @@ enum MediaLibraryError: Error, LocalizedError {
     case databaseOpenFailed
     case schemaCreationFailed(String)
     case insertFailed(String)
-    
+    case integrityCheckFailed(String)
+
     var errorDescription: String? {
         switch self {
         case .databaseOpenFailed:
@@ -118,6 +119,8 @@ enum MediaLibraryError: Error, LocalizedError {
             return "Schema creation failed: \(msg)"
         case .insertFailed(let msg):
             return "Insert failed: \(msg)"
+        case .integrityCheckFailed(let msg):
+            return "The device's media library failed an integrity check (\(msg)). Run Clean & Repair Library in Settings before trying again."
         }
     }
 }
@@ -126,7 +129,7 @@ class MediaLibraryBuilder {
     private static func shouldWriteAppleCatalogStoreFields(for song: SongMetadata) -> Bool {
         guard song.storeId > 0 else { return false }
 
-        let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "local"
+        let metadataSource = UserDefaults.standard.string(forKey: "metadataSource") ?? "apple"
         let richAppleMetadata = UserDefaults.standard.bool(forKey: "appleRichMetadata")
 
         if metadataSource == "apple" {
@@ -296,18 +299,21 @@ class MediaLibraryBuilder {
         
         var integrityStmt: OpaquePointer?
         var integrityOK = false
+        var integrityResult = "unknown"
         if sqlite3_prepare_v2(db, "PRAGMA quick_check", -1, &integrityStmt, nil) == SQLITE_OK {
             if sqlite3_step(integrityStmt) == SQLITE_ROW {
                 if let resultText = sqlite3_column_text(integrityStmt, 0) {
-                    integrityOK = String(cString: resultText) == "ok"
+                    integrityResult = String(cString: resultText)
+                    integrityOK = integrityResult == "ok"
                     Logger.shared.log("[MediaLibraryBuilder] Database integrity check: \(integrityOK ? "PASSED" : "FAILED")")
                 }
             }
         }
         sqlite3_finalize(integrityStmt)
-        
+
         if !integrityOK {
-            Logger.shared.log("[MediaLibraryBuilder] WARNING: Database integrity check failed, but continuing...")
+            Logger.shared.log("[MediaLibraryBuilder] Database integrity check failed (\(integrityResult)) — aborting merge instead of writing on top of a corrupt database.")
+            throw MediaLibraryError.integrityCheckFailed(integrityResult)
         }
         
         Logger.shared.log("[MediaLibraryBuilder] Ensuring base_location 3840/3900 exist...")
@@ -1706,8 +1712,72 @@ class MediaLibraryBuilder {
         
         Logger.shared.log("[MediaLibraryBuilder] Added \(songPids.count) songs to playlist")
     }
-    
-    
+
+    /// Sets a custom cover photo for a playlist. Mirrors the exact rows a real Apple Music
+    /// custom-cover playlist has on-device (verified against a live example): the artwork lives
+    /// in the generic `artwork` table like song/album art does, keyed by `artwork_type = 5`
+    /// (playlist cover) and `artwork_source_type = 100` (user-uploaded, vs. 1 for store-matched),
+    /// with `entity_type = 1` identifying the container as a playlist in `artwork_token` /
+    /// `best_artwork_token`. `container.cover_artwork_recipe` stays untouched — that field is for
+    /// the auto-generated song-mosaic cover, not a custom photo.
+    static func setPlaylistCoverArtwork(db: OpaquePointer?, containerPid: Int64, artworkToken: String, relativePath: String) throws {
+        var stmt: OpaquePointer?
+
+        let artworkSQL = """
+        INSERT OR REPLACE INTO artwork (
+            artwork_token, artwork_source_type, relative_path, artwork_type, interest_data, artwork_variant_type
+        ) VALUES (?, 100, ?, 5, NULL, 0)
+        """
+        if sqlite3_prepare_v2(db, artworkSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, artworkToken, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_text(stmt, 2, relativePath, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                let error = String(cString: sqlite3_errmsg(db))
+                sqlite3_finalize(stmt)
+                throw MediaLibraryError.insertFailed("artwork: \(error)")
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        let tokenSQL = """
+        INSERT OR REPLACE INTO artwork_token (
+            entity_pid, artwork_token, artwork_source_type, artwork_type, entity_type, artwork_variant_type,
+            primary_text_color, secondary_text_color, tertiary_text_color, quaternary_text_color,
+            background_color, gradient_text_color, gradient_color, gradient_size_start, gradient_size_end
+        ) VALUES (?, ?, 100, 5, 1, 0, '', '', '', '', '', '', '', -1.0, -1.0)
+        """
+        if sqlite3_prepare_v2(db, tokenSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, containerPid)
+            sqlite3_bind_text(stmt, 2, artworkToken, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                let error = String(cString: sqlite3_errmsg(db))
+                sqlite3_finalize(stmt)
+                throw MediaLibraryError.insertFailed("artwork_token: \(error)")
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        let bestTokenSQL = """
+        INSERT OR REPLACE INTO best_artwork_token (
+            entity_pid, entity_type, artwork_type, available_artwork_token, fetchable_artwork_token,
+            fetchable_artwork_source_type, artwork_variant_type
+        ) VALUES (?, 1, 5, ?, '', 0, 0)
+        """
+        if sqlite3_prepare_v2(db, bestTokenSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, containerPid)
+            sqlite3_bind_text(stmt, 2, artworkToken, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                let error = String(cString: sqlite3_errmsg(db))
+                sqlite3_finalize(stmt)
+                throw MediaLibraryError.insertFailed("best_artwork_token: \(error)")
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        Logger.shared.log("[MediaLibraryBuilder] Set custom cover artwork for playlist pid \(containerPid)")
+    }
+
+
     static func extractPlaylists(fromDbPath path: String) -> [(name: String, pid: Int64)] {
         var db: OpaquePointer?
         guard sqlite3_open(path, &db) == SQLITE_OK else {

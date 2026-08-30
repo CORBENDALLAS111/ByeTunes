@@ -16,6 +16,33 @@ struct AudioQualityAnalysisView: View {
     @State private var sampleRate: String = "—"
     @State private var bitDepth: String = "—"
     @State private var bitrate: String = "—"
+    @State private var verdict: QualityVerdict?
+
+    private enum VerdictLevel {
+        case good, caution, warning
+
+        var iconName: String {
+            switch self {
+            case .good: return "checkmark.seal.fill"
+            case .caution: return "exclamationmark.triangle.fill"
+            case .warning: return "xmark.seal.fill"
+            }
+        }
+
+        var tint: Color {
+            switch self {
+            case .good: return .green
+            case .caution: return .orange
+            case .warning: return .red
+            }
+        }
+    }
+
+    private struct QualityVerdict {
+        let level: VerdictLevel
+        let title: String
+        let detail: String
+    }
 
     private let tileColumns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
 
@@ -68,6 +95,10 @@ struct AudioQualityAnalysisView: View {
             .padding(.horizontal, 20)
             .padding(.top, 26)
 
+            if let verdict {
+                verdictBanner(verdict)
+            }
+
             if let errorMessage {
                 Text(errorMessage)
                     .font(.footnote)
@@ -86,7 +117,7 @@ struct AudioQualityAnalysisView: View {
 
             Spacer(minLength: 12)
         }
-        .presentationDetents([.height(500)])
+        .presentationDetents([.height(580)])
         .presentationDragIndicator(.visible)
         .task {
             await analyze()
@@ -148,6 +179,31 @@ struct AudioQualityAnalysisView: View {
         .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
     }
 
+    private func verdictBanner(_ verdict: QualityVerdict) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: verdict.level.iconName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(verdict.level.tint)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verdict.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.primary)
+                Text(verdict.detail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(verdict.level.tint.opacity(0.12))
+        .cornerRadius(14)
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+    }
+
     private func analyze() async {
         let data = await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
             manager.downloadSongFileForAnalysis(song) { data in
@@ -182,6 +238,7 @@ struct AudioQualityAnalysisView: View {
         var resolvedSampleRate: Double = 0
         var resolvedBitDepth: Int = 0
         var resolvedBitRate: Int = 0
+        var resolvedChannels: Int = 0
 
         for track in tracks {
             if resolvedBitRate == 0 {
@@ -202,6 +259,9 @@ struct AudioQualityAnalysisView: View {
                     if resolvedBitDepth == 0, asbd.mBitsPerChannel > 0 {
                         resolvedBitDepth = Int(asbd.mBitsPerChannel)
                     }
+                    if resolvedChannels == 0, asbd.mChannelsPerFrame > 0 {
+                        resolvedChannels = Int(asbd.mChannelsPerFrame)
+                    }
                 }
             }
         }
@@ -221,7 +281,74 @@ struct AudioQualityAnalysisView: View {
         sampleRate = resolvedSampleRate > 0 ? String(format: "%.1f kHz", resolvedSampleRate / 1000) : "Unknown"
         bitDepth = resolvedBitDepth > 0 ? "\(resolvedBitDepth)-bit" : "N/A (lossy)"
         bitrate = resolvedBitRate > 0 ? "\(resolvedBitRate / 1000) kbps" : "Unknown"
+        verdict = Self.evaluateQuality(
+            declaredExtension: song.fileExtension,
+            resolvedCodec: resolvedCodec,
+            sampleRate: resolvedSampleRate,
+            bitDepth: resolvedBitDepth,
+            channels: resolvedChannels,
+            bitRateBps: resolvedBitRate
+        )
         isLoading = false
+    }
+
+    private static func evaluateQuality(
+        declaredExtension: String,
+        resolvedCodec: String,
+        sampleRate: Double,
+        bitDepth: Int,
+        channels: Int,
+        bitRateBps: Int
+    ) -> QualityVerdict? {
+        let ext = declaredExtension.lowercased()
+
+        if ext == "flac", resolvedCodec != "FLAC" {
+            return QualityVerdict(
+                level: .warning,
+                title: "Mislabeled File",
+                detail: "This file has a .flac extension, but its actual audio stream is \(resolvedCodec), not FLAC. It was likely renamed rather than genuinely encoded as lossless."
+            )
+        }
+
+        if ext == "wav" || ext == "aiff" || ext == "aif" {
+            if !resolvedCodec.contains("PCM") {
+                return QualityVerdict(
+                    level: .warning,
+                    title: "Mislabeled File",
+                    detail: "This file claims to be uncompressed \(ext.uppercased()) audio, but its actual stream is \(resolvedCodec)."
+                )
+            }
+        }
+
+        if resolvedCodec == "FLAC" || resolvedCodec == "ALAC" {
+            guard sampleRate > 0, bitDepth > 0, channels > 0, bitRateBps > 0 else { return nil }
+            let rawPcmBitRate = sampleRate * Double(bitDepth) * Double(channels)
+            let compressionRatio = Double(bitRateBps) / rawPcmBitRate
+
+            if compressionRatio < 0.25 {
+                return QualityVerdict(
+                    level: .caution,
+                    title: "Unusually High Compression",
+                    detail: "This \(resolvedCodec) file compresses to only \(Int(compressionRatio * 100))% of its raw PCM size. Genuine lossless recordings rarely compress this far — it may have been upscaled from a lossy source instead of the original recording."
+                )
+            }
+
+            return QualityVerdict(
+                level: .good,
+                title: "Looks Genuinely Lossless",
+                detail: "The bitrate is consistent with real lossless \(resolvedCodec) encoding for this sample rate and bit depth."
+            )
+        }
+
+        if resolvedCodec == "AAC" || resolvedCodec == "MP3" || resolvedCodec == "Opus", bitRateBps > 0, bitRateBps < 128_000 {
+            return QualityVerdict(
+                level: .caution,
+                title: "Low Bitrate",
+                detail: "At \(bitRateBps / 1000) kbps, this \(resolvedCodec) file is encoded well below typical streaming quality — you may notice compression artifacts."
+            )
+        }
+
+        return nil
     }
 
     private static func codecName(forFormatID formatID: AudioFormatID, fileExtension: String) -> String {

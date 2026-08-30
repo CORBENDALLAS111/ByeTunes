@@ -4,7 +4,7 @@ struct iTunesSearchSheet: View {
     @Binding var song: SongMetadata
     @Binding var isPresented: Bool
     
-    @AppStorage("metadataSource") private var metadataSource = "local"
+    @AppStorage("metadataSource") private var metadataSource = "apple"
     
     @State private var searchQuery: String = ""
     @State private var itunesResults: [iTunesSong] = []
