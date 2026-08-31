@@ -1122,10 +1122,6 @@ struct MusicView: View {
                             self.songs.removeAll()
                         }
                     } else {
-                        // Progress ticking past a song already trimmed it from the visible queue
-                        // above, but a false completion means the on-device library commit never
-                        // actually landed — those songs were never confirmed injected, so put them
-                        // back instead of letting them silently vanish with no way to retry.
                         if lastProcessedIndex > 0 {
                             let unconfirmedSongs = Array(songsToInfect.prefix(lastProcessedIndex))
                             withAnimation {
@@ -1637,8 +1633,6 @@ struct MusicView: View {
                             self.songs.removeAll()
                         }
                     } else {
-                        // See startInjectionProcess() — progress-trimmed songs aren't confirmed
-                        // injected just because a false completion arrived, so put them back.
                         if lastProcessedIndex > 0 {
                             let unconfirmedSongs = Array(songsToInfect.prefix(lastProcessedIndex))
                             withAnimation {

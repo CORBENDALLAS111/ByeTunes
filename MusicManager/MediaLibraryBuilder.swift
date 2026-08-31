@@ -1713,13 +1713,6 @@ class MediaLibraryBuilder {
         Logger.shared.log("[MediaLibraryBuilder] Added \(songPids.count) songs to playlist")
     }
 
-    /// Sets a custom cover photo for a playlist. Mirrors the exact rows a real Apple Music
-    /// custom-cover playlist has on-device (verified against a live example): the artwork lives
-    /// in the generic `artwork` table like song/album art does, keyed by `artwork_type = 5`
-    /// (playlist cover) and `artwork_source_type = 100` (user-uploaded, vs. 1 for store-matched),
-    /// with `entity_type = 1` identifying the container as a playlist in `artwork_token` /
-    /// `best_artwork_token`. `container.cover_artwork_recipe` stays untouched — that field is for
-    /// the auto-generated song-mosaic cover, not a custom photo.
     static func setPlaylistCoverArtwork(db: OpaquePointer?, containerPid: Int64, artworkToken: String, relativePath: String) throws {
         var stmt: OpaquePointer?
 

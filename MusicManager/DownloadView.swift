@@ -1897,14 +1897,6 @@ enum DownloadSupport {
         return fallback
     }
 
-    /// The file extension to fall back to when the response's `Content-Type` doesn't clearly say
-    /// what was delivered — must reflect what THIS candidate actually asked for, not a blanket
-    /// default. Every backend candidate hardcoded `"flac"` here regardless of its own
-    /// `requestedFormat`, so whenever the server's Content-Type was ambiguous, a track downloaded
-    /// through an "MP3 Fallback" candidate (or any non-FLAC request) still got saved with a
-    /// `.flac` extension — silently mislabeling the file everywhere the extension is trusted
-    /// (`audioFormatLabel`'s fallback path when codec inspection can't parse the mismatched
-    /// container, quality badges, etc.) even though the audio itself was correctly MP3.
     static func fallbackExtension(forRequestedFormat format: String?, defaultingTo fallback: String) -> String {
         guard let format else { return fallback }
         switch format.lowercased() {
@@ -1943,18 +1935,6 @@ enum DownloadSupport {
     }
 }
 
-/// Enforces a minimum gap between successive download starts, on top of (not instead of)
-/// `maxConcurrentDownloads` — mirrors ByeTunes's `DownloadGate`, added there after bursts of
-/// simultaneous requests were observed triggering backend 429/500s even while concurrency itself
-/// stayed within the cap. The backend reacts to burst rate, not just raw concurrency, so capping
-/// concurrency alone isn't sufficient insurance.
-///
-/// `minSpacing` is a per-call floor rather than a fixed value baked into `init` — lossless formats
-/// (FLAC/ALAC) are far more expensive for the backend to generate than MP3, so a burst of 3
-/// concurrent FLAC requests throttles the backend hard even at the same 300ms spacing that's fine
-/// for MP3 (confirmed: MusicManager and ByeTunes share the exact same backend and gate/pacer shape,
-/// but ByeTunes defaults to MP3 and doesn't see this). Callers pass a wider floor for lossless
-/// formats instead of this actor hardcoding format awareness itself.
 private actor DownloadStartPacer {
     private let defaultMinSpacing: Duration
     private var lastStart: ContinuousClock.Instant?
@@ -1981,13 +1961,6 @@ private final class BackgroundTaskState {
 
 @MainActor
 final class DownloadViewModel: ObservableObject {
-    /// One instance for the whole app session — matching `DeviceManager.shared` /
-    /// `BackgroundAudioDownloadManager.shared` elsewhere in this codebase. Needed because
-    /// `LegacyTabBarView` (iOS <26) mounts `DownloadView` behind an `if selectedTab == ...`
-    /// branch (`TabViews.swift`), which tears down and recreates the view — and would recreate
-    /// a plain `DownloadViewModel()` with it, silently orphaning any in-flight foreground
-    /// download and losing the queue's live state. Referencing the shared instance instead means
-    /// `@StateObject` just re-observes the same object across that teardown/recreation.
     static let shared = DownloadViewModel()
 
     @Published var artistResults: [DownloadArtist] = []
@@ -1997,11 +1970,6 @@ final class DownloadViewModel: ObservableObject {
     @Published var pendingDirectLinkAction: DownloadDirectLinkAction?
     @Published var isPaused = false
     private var foregroundWorkerTasks: [String: Task<Void, Never>] = [:]
-    /// Lossless formats (FLAC/ALAC) are far more expensive for the backend to generate than MP3 —
-    /// 3 concurrent lossless requests throttle the backend hard (confirmed against ByeTunes, which
-    /// shares this exact backend and gate/pacer shape but defaults to MP3 and doesn't see this), so
-    /// lossless downloads get a lower concurrency cap and wider start spacing (see
-    /// `downloadStartPacer` call sites) instead of a fixed value.
     private var maxConcurrentDownloads: Int {
         isLosslessDownloadFormat ? 2 : 3
     }
@@ -2009,33 +1977,9 @@ final class DownloadViewModel: ObservableObject {
         let format = desiredDownloadFormat().lowercased()
         return format == "flac" || format == "alac"
     }
-    /// Whether the app is currently in the foreground. While active, transfers always run
-    /// through the in-process foreground path (`startForegroundWorker`) so all
-    /// `maxConcurrentDownloads` slots genuinely transfer bytes in parallel — the OS-managed
-    /// background session (`BackgroundAudioDownloadManager`) schedules its own tasks and won't
-    /// reliably run more than one real transfer at a time. The background session is reserved
-    /// for tracks still in flight once the app actually leaves the foreground.
-    ///
-    /// Was previously hardcoded `true` and only ever corrected by `DownloadView`'s own
-    /// `.onReceive` hooks for `UIApplication.didBecomeActive`/`didEnterBackground` — which never
-    /// fire if this view model is first created while the app is already backgrounded (e.g. a
-    /// silent relaunch just to service `handleEventsForBackgroundURLSession`, with the Download
-    /// tab never shown). Any download started or recovered in that state used the short foreground
-    /// timeout instead of the durable background `URLSession`, so it either fell back to a lower
-    /// quality format when the real one timed out, or stalled until the user reopened the app.
-    /// Seeding from the actual `UIApplication.applicationState` at init, and observing the
-    /// lifecycle notifications directly here instead of relying on the view, keeps this correct
-    /// regardless of whether any view is ever shown.
     private var isAppActive = UIApplication.shared.applicationState != .background
     private var lifecycleObservers: [NSObjectProtocol] = []
-    /// Track IDs whose foreground worker was cancelled specifically to hand them off to the
-    /// background session (see `appDidEnterBackground`), as opposed to a user-initiated
-    /// pause/cancel — lets `runForegroundWorker`'s cancellation handler tell the two apart and
-    /// requeue only the handoff case.
     private var pendingBackgroundHandoffTrackIDs: Set<String> = []
-    /// Shared between the foreground and background-native start paths — both ultimately hit the
-    /// same backend endpoint, so pacing needs to apply regardless of which path a given track's
-    /// download takes.
     private let downloadStartPacer = DownloadStartPacer(minSpacing: .milliseconds(300))
 
     var shouldShowPauseButton: Bool {
@@ -2120,8 +2064,6 @@ final class DownloadViewModel: ObservableObject {
         return Double(completedQueueCount) / Double(totalQueueCount)
     }
 
-    /// Overall batch progress across every currently-downloading track, including partial
-    /// credit for in-flight bytes — not any single track's own progress.
     var aggregateDownloadProgress: Double {
         guard totalQueueCount > 0 else { return 0 }
         let activeCredit = downloadProgressByTrackID.values.reduce(0, +)
@@ -2550,10 +2492,6 @@ final class DownloadViewModel: ObservableObject {
         if totalQueueCount > completedQueueCount {
             totalQueueCount = max(0, totalQueueCount - 1)
         }
-        // A track can fail fast (e.g. an immediate "unsupported source" check) while a background
-        // URLSession attempt for the same track is still in flight underneath it. Without telling
-        // the background manager to stand down, that stray task's eventual completion resurrects
-        // this row right back into the Failed section after the user already removed it.
         if backgroundDownloadsEnabled {
             cancelledBackgroundTrackIDs.insert(trackID)
             Task {
@@ -3725,9 +3663,6 @@ final class DownloadViewModel: ObservableObject {
     }
 
 
-    /// Tops up the foreground worker pool to `maxConcurrentDownloads`, starting a new worker
-    /// task per free slot. Safe to call repeatedly (e.g. after every enqueue and every worker
-    /// completion) — it's a no-op once capacity is full or the queue is empty.
     private func processQueueIfNeeded() async {
         if backgroundDownloadsEnabled && !isAppActive {
             startBackgroundQueueIfNeeded()
@@ -3794,9 +3729,6 @@ final class DownloadViewModel: ObservableObject {
         endLiveActivityIfQueueFinished(finalPhase: .completed)
     }
 
-    /// Shared teardown once a foreground worker's single track is done (however it ended) —
-    /// frees its slot in `activeDownloadTrackIDs` so `processQueueIfNeeded` can immediately
-    /// backfill it from `pendingQueue`.
     private func finishForegroundWorker(for trackID: String, incrementCompleted: Bool) {
         foregroundWorkerTasks[trackID] = nil
         activeDownloadTrackIDs.remove(trackID)
@@ -3947,8 +3879,6 @@ final class DownloadViewModel: ObservableObject {
         guard !isPaused else { return }
 
         if isAppActive {
-            // Foreground again — hand remaining queued tracks back to the concurrent
-            // in-process path instead of continuing to feed the background session.
             Task { await processQueueIfNeeded() }
         } else if canAdvanceBackgroundQueueNow {
             primeBackgroundPreparation()
@@ -4265,12 +4195,6 @@ final class DownloadViewModel: ObservableObject {
         _ result: Result<BackgroundDownloadResult, Error>,
         for track: DownloadTrack
     ) async {
-        // The background URLSession delivers this completion whenever the OS gets around to it —
-        // sometimes well after the user has already removed the track from the Failed section.
-        // Without this guard, a stale completion for an already-removed track resurrects it by
-        // writing `.failed` straight back into trackStates even though it's no longer part of the
-        // live queue, which is what made removed Failed rows reappear (and then crash the second
-        // time they were swiped away, since the row's backing data was only half torn down).
         guard !cancelledBackgroundTrackIDs.contains(track.id) else {
             log("Ignoring recovered background result for \(track.id) — it was removed from the queue.")
             clearActiveBackgroundTrack(track.id)
@@ -4368,10 +4292,6 @@ final class DownloadViewModel: ObservableObject {
         let candidates = try await primaryCandidates(for: resolvedSource, track: track)
         if !candidates.isEmpty {
             do {
-                // `executeCandidatesUntilSuccess` never actually returns nil — it either returns
-                // a real outcome or throws — so without this do/catch, any failure here (a real
-                // backend rejection, not just this `if let`'s vacuous nil case) propagated straight
-                // out of this function and the last-resort Spotify mapping below was never reached.
                 if let outcome = try await executeCandidatesUntilSuccess(
                     candidates,
                     trackID: track.id,
@@ -4550,16 +4470,6 @@ final class DownloadViewModel: ObservableObject {
         var lastError: Error = DownloadError.mappingFailed("All backend requests failed.")
 
         for candidate in candidates {
-            // A cancellation here (e.g. `appDidEnterBackground()` cancelling this track's
-            // foreground worker to hand it off to the background session) surfaces as a thrown
-            // error from the candidate's request, indistinguishable at this point from a genuine
-            // backend failure. Without this check, the catch block below just logged it as "this
-            // candidate failed" and moved on to try the next one (typically the MP3 fallback) —
-            // under the same already-cancelled Task, which could still complete a fast MP3
-            // request before anything else noticed the cancellation. That silently turned an
-            // intended abort-and-hand-off into a quiet downgrade to MP3, and it happened
-            // deterministically to the tracks that were actually mid-download at the moment of
-            // backgrounding — i.e. exactly the first `maxConcurrentDownloads` tracks of a batch.
             guard !Task.isCancelled else {
                 throw CancellationError()
             }
@@ -4699,11 +4609,6 @@ final class DownloadViewModel: ObservableObject {
         return try saveDownloadedData(data, suggestedName: suggestedName, fileExtension: fileExtension)
     }
 
-    /// Compares what format was actually delivered (via the backend's `X-Audio-*` response
-    /// headers) against what was requested, and records a user-facing note when they differ —
-    /// e.g. FLAC was requested but the track wasn't available lossless on Deezer/Tidal, so the
-    /// backend silently served MP3 with a 200 instead of erroring. Clears any stale note when
-    /// a retry succeeds at the originally requested format.
     private func recordQualityNoteIfNeeded(trackID: String, requestedFormat: String?, httpResponse: HTTPURLResponse?) {
         guard let requestedFormat else { return }
         guard let deliveredFormat = httpResponse?.value(forHTTPHeaderField: "X-Audio-Format") else { return }
@@ -6139,12 +6044,6 @@ final class DownloadViewModel: ObservableObject {
         return Self.appleMusicUnavailableMessage
     }
 
-    /// The technical form of a download error (raw HTTP status/body, backend JSON, low-level
-    /// `URLError` codes) is exactly what's useful in the console log, and exactly what a user
-    /// doesn't need staring back at them in the queue when a track fails. This is only ever the
-    /// user-facing summary shown after every backend candidate has been exhausted — the full
-    /// per-candidate error detail is still logged as each one fails (see
-    /// `executeCandidatesUntilSuccess`), so nothing is lost for actual debugging.
     private static func friendlyDownloadFailureMessage(for error: Error) -> String {
         if let urlError = error as? URLError {
             switch urlError.code {
@@ -6175,9 +6074,6 @@ final class DownloadViewModel: ObservableObject {
         return "Download failed. Please try again."
     }
 
-    /// Pushes the current set of concurrently-active downloads (name/progress each) to the
-    /// Live Activity. `phaseOverride` flags a transient moment (e.g. a track just entered
-    /// `.preparing`) without disturbing the other in-flight items' own progress.
     private func pushLiveActivityUpdate(phaseOverride: DownloadLiveActivityAttributes.Phase? = nil) {
         guard backgroundDownloadsEnabled else { return }
         let items: [DownloadLiveActivityAttributes.ActiveItem] = activeDownloadTrackIDs.sorted().compactMap { id in
@@ -6196,9 +6092,6 @@ final class DownloadViewModel: ObservableObject {
         )
     }
 
-    /// Ends the Live Activity with `finalPhase` only once every active and pending download is
-    /// actually done — a single track finishing (successfully or not) while siblings are still
-    /// downloading just refreshes the activity with whoever's left, rather than dismissing it.
     private func endLiveActivityIfQueueFinished(finalPhase: DownloadLiveActivityAttributes.Phase) {
         guard backgroundDownloadsEnabled else { return }
         guard activeDownloadTrackIDs.isEmpty, pendingQueue.isEmpty else {
@@ -6300,12 +6193,6 @@ final class DownloadViewModel: ObservableObject {
             return
         }
 
-        // Tracks finished in this session need to be persisted as `.done` too, not just folded
-        // into `completedQueueCount` — otherwise a relaunch mid-queue (some tracks done, others
-        // still pending/active) restores the aggregate counter correctly but drops every already
-        // -finished track's individual state back to `.idle`, which `queueSnapshot()` filters out
-        // entirely. The counter then shows e.g. 8/8 while the Queue Details sheet only lists the
-        // handful of tracks that finished after the relaunch.
         let doneIDs = queueOrder.filter { trackStates[$0] == .done }
 
         let snapshot = PersistedDownloadQueue(
@@ -6383,7 +6270,6 @@ struct DownloadQueueSnapshot {
     let queuedItems: [Item]
     let doneItems: [Item]
     let failedItems: [Item]
-    /// Overall batch progress across every currently-active download, not any single track's.
     let aggregateProgress: Double
     let queueCounterText: String
     let aggregateSpeedBps: Double
@@ -6571,11 +6457,6 @@ struct DownloadQueueDetailsSheet: View {
                         }
                         .onDelete { offsets in
                             let ids = offsets.map { snapshot.queuedItems[$0].id }
-                            // Deferred a tick: removing the section's last row and the
-                            // conditional `if !snapshot.queuedItems.isEmpty` Section vanishing
-                            // in the same SwiftUI transaction crashes List's diffing. Letting
-                            // the delete animation finish before the model mutation lands
-                            // avoids it.
                             DispatchQueue.main.async {
                                 for id in ids {
                                     vm.removeQueued(trackID: id)

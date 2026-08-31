@@ -1816,7 +1816,6 @@ private enum DownloaderYoinkifyFormatOption: String, CaseIterable, Identifiable,
 }
 
 // MARK: - FlowLayout
-// A simple left-to-right wrapping layout for supporter chips.
 struct FlowLayout: Layout {
     var spacing: CGFloat = 8
 

@@ -1,19 +1,9 @@
 import Foundation
 import Network
 
-/// Resolves the current Bonjour-advertised port for `_remotepairing._tcp` on the
-/// LocalDevVPN tunnel interface. The on-device RemoteXPC/RSD service doesn't reliably
-/// bind to a fixed port every session, so the port has to be discovered per-connection
-/// rather than hardcoded.
 enum RemotePairingDiscovery {
     private static let serviceType = "_remotepairing._tcp"
 
-    /// Repeatedly browses for the service, retrying if the VPN tunnel interface only just came
-    /// up and hasn't finished advertising over mDNS yet (e.g. VPN connected after app launch,
-    /// then the user hits Retry immediately). A single 3s browse can lose that race even though
-    /// the service shows up moments later, which used to make every retry fall back to the
-    /// hardcoded `RP_PAIRING_PORT` and fail outright when the on-device service wasn't actually
-    /// bound there. Returns `nil` only if every attempt comes up empty.
     static func resolvePort(attempts: Int = 3, timeoutPerAttempt: TimeInterval = 2, delayBetweenAttempts: TimeInterval = 1) -> UInt16? {
         for attempt in 0..<attempts {
             if let port = resolvePortOnce(timeout: timeoutPerAttempt) {
@@ -26,8 +16,6 @@ enum RemotePairingDiscovery {
         return nil
     }
 
-    /// Browses for the service and resolves the first result's port.
-    /// Returns `nil` if nothing is found within `timeout`.
     private static func resolvePortOnce(timeout: TimeInterval) -> UInt16? {
         let semaphore = DispatchSemaphore(value: 0)
         var resolvedPort: UInt16?

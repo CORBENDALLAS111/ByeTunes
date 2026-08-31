@@ -122,8 +122,6 @@ enum QueuePersistenceStore {
         UserDefaults.standard.removeObject(forKey: downloadQueueKey)
     }
 
-    /// Clears a legacy UserDefaults key from a since-removed deferred-enrichment feature, so
-    /// installs upgrading from an older version don't keep orphaned data sitting around.
     static func clearDeferredDownloadEnrichments() {
         UserDefaults.standard.removeObject(forKey: deferredDownloadEnrichmentKey)
     }

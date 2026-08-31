@@ -34,14 +34,6 @@ final class BackgroundAudioDownloadManager: NSObject {
     static let shared = BackgroundAudioDownloadManager()
     static let sessionIdentifier = "com.musicmanager.downloads.background"
 
-    // A background download can finish while nothing is listening (app woken purely for
-    // `handleEventsForBackgroundURLSession`, before `DownloadViewModel` ever gets created) and
-    // then get killed before anyone claims the result. `pendingResultsByTrackID` alone doesn't
-    // survive that — it's wiped along with the rest of process memory — so a fresh launch's
-    // recovery pass finds no matching task and no pending result, and just re-downloads the
-    // track from scratch even though the file already finished. Mirroring successful results to
-    // disk here closes that gap: `consumePendingResult` falls back to this store, so recovery
-    // after a relaunch can still pick up the already-downloaded file.
     private struct PersistedPendingResult: Codable {
         let trackID: String
         let filePath: String

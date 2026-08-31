@@ -266,8 +266,6 @@ struct AudioQualityAnalysisView: View {
             }
         }
 
-        // AVFoundation's compressed-format descriptor doesn't carry bit depth for FLAC
-        // (it lives in the FLAC STREAMINFO block instead), so read it directly from the file.
         if resolvedCodec == "FLAC", resolvedBitDepth == 0, let flacDepth = Self.flacBitDepth(from: data) {
             resolvedBitDepth = flacDepth
         }
@@ -370,14 +368,12 @@ struct AudioQualityAnalysisView: View {
         }
     }
 
-    /// Reads bits-per-sample straight out of a FLAC file's STREAMINFO metadata block
-    /// (bytes 10-13 of the block, per the FLAC spec), since AVFoundation doesn't expose it.
     private static func flacBitDepth(from data: Data) -> Int? {
         let magic = Array("fLaC".utf8)
         guard data.count >= 8 + 18, data.prefix(4).elementsEqual(magic) else { return nil }
 
         let blockType = data[4] & 0x7F
-        guard blockType == 0 else { return nil } // STREAMINFO is always the first metadata block
+        guard blockType == 0 else { return nil }
 
         let streamInfoStart = data.startIndex + 8
         let b10 = UInt32(data[streamInfoStart + 10])

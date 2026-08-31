@@ -13,9 +13,6 @@ struct ManualMetadataEditor: View {
     @State private var year: String = ""
     @State private var trackNumber: String = ""
     @State private var lyrics: String = ""
-    // content_rating is 3-state on device (0 = none, 1 = explicit, 2 = clean) — a plain on/off
-    // toggle here could only ever write 0 or 1, so saving a "clean"-tagged song without even
-    // touching this control used to silently flip it back to fully explicit.
     @State private var explicitRating: Int = 0
 
     @State private var useCustomAlbumColor: Bool = false

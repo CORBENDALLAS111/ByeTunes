@@ -142,13 +142,6 @@ class DeviceManager: ObservableObject {
     private var isReconnecting = false
     private var pendingReconnectCompletions: [(Bool) -> Void] = []
     private let reconnectCoordinationLock = NSLock()
-    // A single shared `Bool` used to mean "cancel whatever repair is running" let one operation's
-    // leftover cancellation state silently abort a *different*, unrelated repair started later
-    // (e.g. cancel "Advanced Artwork & Metadata Fix", then "Fix Artwork" inherits the stale flag
-    // and immediately bails with "Repair cancelled" even though nobody cancelled it). A fresh
-    // token per operation fixes that: only `cancelCurrentRepairOperation()` can invalidate whatever
-    // operation is actually running right now, and starting a new one always gets a token nothing
-    // else can accidentally match.
     nonisolated(unsafe) private var currentRepairOperationToken: UUID?
 
     func beginRepairOperation() -> UUID {
@@ -466,13 +459,6 @@ class DeviceManager: ObservableObject {
         hasValidExpectedPairingFile = validateExpectedPairingFile()
     }
 
-    /// Validates the picked file *before* it ever touches `expectedPairingFile`, and commits it
-    /// with an atomic replace rather than delete-then-copy. Previously a failing import would
-    /// first delete whatever pairing file was already there, then copy the new one in — if the
-    /// copy failed partway (interrupted, disk pressure, a revoked security scope), the user was
-    /// left with no pairing file at all, worse off than before they tried to update it. Validating
-    /// a scratch copy first means a bad file is simply rejected, leaving the existing working file
-    /// (if any) completely untouched.
     func importPairingFile(from url: URL) throws {
         let needsSecurityScope = url.startAccessingSecurityScopedResource()
         defer {
@@ -496,9 +482,6 @@ class DeviceManager: ObservableObject {
             : validateLockdownPairingFile(at: tempURL)
 
         guard matchesExpectedFormat else {
-            // Two incompatible pairing file formats exist depending on the host iPhone's OS
-            // version (see `requiresRPPairingTunnel`) — picking the wrong export for your current
-            // OS is an easy mistake, so check for that specifically rather than a bare "invalid".
             let matchesOtherFormat = requiresRPPairingTunnel
                 ? validateLockdownPairingFile(at: tempURL)
                 : validateRPPairingFile(at: tempURL)
@@ -612,10 +595,6 @@ class DeviceManager: ObservableObject {
         }
         defer { rp_pairing_file_free(rpPairingHandle) }
 
-        // The on-device RemoteXPC/RSD service backing this tunnel doesn't reliably bind to
-        // RP_PAIRING_PORT every session (confirmed against LocalDevVPN-based connections) —
-        // resolve its actual current port via Bonjour first, falling back to the fixed port
-        // if discovery times out.
         let resolvedPort = RemotePairingDiscovery.resolvePort() ?? RP_PAIRING_PORT
         if resolvedPort != RP_PAIRING_PORT {
             self.logOnce("[DeviceManager] RPPairing service resolved to port \(resolvedPort) via Bonjour (default \(RP_PAIRING_PORT))", key: "connection_status")
@@ -654,20 +633,6 @@ class DeviceManager: ObservableObject {
         return true
     }
 
-    
-    // Multiple callers can race to reconnect at once — the auto-reconnect watcher firing on
-    // its own timer, and every concurrent AFC worker independently detecting a dead transport
-    // and calling `startHeartbeat(forceReconnect: true)`, which skips all the throttling below.
-    // Each call tears down and rebuilds the *shared* provider/handshake/adapter handles via
-    // `resetConnectionHandles()`, so two overlapping attempts stomp on each other — one call's
-    // teardown can yank the transport out from under another call's in-flight handshake. This
-    // used to be a narrow window back when tunnel setup was a near-instant hardcoded-port
-    // connect; now that it includes a Bonjour lookup (up to 3s) plus a full RSD handshake, the
-    // window is wide enough that concurrent reconnects (six-way parallel AFC uploads, or the
-    // watcher's 6s "stale connecting" retrigger firing before the previous attempt even
-    // finishes) collide routinely. Coalesce: only one reconnect sequence actually runs at a
-    // time; anyone who calls in while one is in flight just waits on its result instead of
-    // starting a competing one.
     func startHeartbeat(forceReconnect: Bool = false, completion: ((Bool) -> Void)? = nil) {
         if !forceReconnect {
             if connectionStatus == "Connecting..." {
@@ -765,16 +730,6 @@ class DeviceManager: ObservableObject {
                 outcomeSemaphore.signal()
             }
 
-            // `establishHeartbeat` calls into native tunnel/handshake code that only bounds the
-            // raw socket connect with a timeout — the pairing handshake, TLS-PSK negotiation, and
-            // RSD handshake that follow have none. If the VPN tunnel accepts the connection but
-            // then stalls (a stale pairing session, a half-dead tunnel silently dropping packets
-            // instead of refusing), this call can hang indefinitely and previously left the UI
-            // stuck at "Connecting..." forever — with the auto-reconnect watcher only piling more
-            // attempts on top rather than resolving anything. Bound the wait here instead: past
-            // 20s, surface a clean failure so the existing retry/backoff logic can recover. The
-            // native call itself can't be cancelled, so the underlying thread may keep running
-            // after this fires, but `reportOutcome`'s guard means its eventual result is ignored.
             if outcomeSemaphore.wait(timeout: .now() + 20) == .timedOut {
                 Logger.shared.log("[DeviceManager] Heartbeat establishment timed out after 20s; treating as failed.")
                 reportOutcome(success: false)
@@ -861,14 +816,6 @@ class DeviceManager: ObservableObject {
         }
     }
 
-    /// Keeps the heartbeat alive for as long as the underlying transport stays usable, self-healing
-    /// through individual probe failures instead of tearing down `provider`/`rpAdapter`/`rpHandshake`
-    /// on the spot. Those handles are shared with every other service (AFC, lockdown, notification
-    /// proxy — see `connectAfcClient` etc.), so a transient heartbeat blip used to nuke the whole
-    /// transport and force a full re-pair/re-tunnel even though AFC/lockdown were fine. Now a failed
-    /// probe just tries to open a *fresh* heartbeat client on the *same* transport; only if that
-    /// also fails do we conclude the transport itself (not just one probe) is actually gone, and let
-    /// the caller reset it.
     private func runHeartbeatMonitorLoop(sessionID: UInt64, initialClient: HeartbeatClientHandle?) {
         var client = initialClient
         var consecutivePoloFailures = 0
@@ -879,12 +826,6 @@ class DeviceManager: ObservableObject {
             let marcoErr = heartbeat_get_marco(client, marcoInterval, &newInterval)
 
             guard marcoErr == IdeviceSuccess else {
-                // A timed-out/missing Marco is routine — it just means the device hasn't pinged
-                // yet, not that anything is wrong. `send_polo` is only a valid *reply* to a Marco
-                // (see idevice's heartbeat.rs), so sending one anyway here would be an unsolicited,
-                // out-of-turn write the device doesn't expect — which is exactly what the old code
-                // did unconditionally, and is the most likely reason every single Marco/Polo cycle
-                // was failing outright instead of just occasionally.
                 Thread.sleep(forTimeInterval: 1)
                 continue
             }
@@ -1916,10 +1857,6 @@ class DeviceManager: ObservableObject {
             return
         }
 
-        // Past this point the repair starts actually deleting files and rewriting the database —
-        // no more cancellation checks beyond here, since bailing out mid-mutation would risk
-        // leaving the device in a half-repaired state (files removed but DB not yet updated to
-        // match, or vice versa).
         progress("Cleaning orphaned storage...", 0.75)
         var deletedOrphanAudio = 0
         for path in orphanedAudioPaths {
@@ -2917,10 +2854,6 @@ class DeviceManager: ObservableObject {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Matches the on-device convention (verified against a real playlist cover): the artwork
-    /// file's relative path is the SHA1 of its own artwork_token, split into a 2-char subfolder
-    /// and the remaining 38 chars as the filename — identical to how song artwork paths are
-    /// derived from their token elsewhere in this file.
     private static func artworkRelativePath(fromToken token: String) -> String {
         var hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         let tokenData = Data(token.utf8)
@@ -4099,9 +4032,6 @@ class DeviceManager: ObservableObject {
         return fallback
     }
 
-    /// `base_location.path` values in MediaLibrary.sqlitedb are sometimes stored relative to
-    /// `/iTunes_Control` (e.g. `"Music/F00"`) rather than as full absolute paths — normalizes
-    /// either form to a proper absolute `/iTunes_Control/...` path.
     private func normalizeITunesControlPath(_ raw: String) -> String {
         var path = raw
         if !path.hasPrefix("/") { path = "/" + path }
@@ -5769,19 +5699,10 @@ class DeviceManager: ObservableObject {
     
     enum DirectoryListResult {
         case files([String])
-        /// The directory itself doesn't exist on the device (AFC ObjectNotFound) — a
-        /// definitive signal, not a transient failure, so callers can safely conclude
-        /// anything expected inside it is genuinely gone.
         case confirmedMissing
-        /// Couldn't determine either way (connection issue, unexpected error, etc.) — treat
-        /// as unknown, not as evidence of absence.
         case unknown
     }
 
-    /// Same as `listFiles`, but distinguishes "directory confirmed absent" from "couldn't
-    /// check" instead of collapsing both into `nil` — needed by callers (like the stale
-    /// downloaded-status repair) where treating an unknown failure as "missing" would produce
-    /// false positives.
     func listFilesOrConfirmMissing(remotePath: String, completion: @escaping (DirectoryListResult) -> Void) {
         Logger.shared.log("[DeviceManager] listFilesOrConfirmMissing called for: \(remotePath)")
 

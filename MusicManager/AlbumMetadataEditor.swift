@@ -22,11 +22,6 @@ struct AlbumMetadataEditor: View {
         case albumName, artist, genre, year
     }
 
-    // content_rating is a 3-state field on device (0 = none, 1 = explicit, 2 = clean), not a
-    // boolean — a plain on/off toggle here can only ever write 0 or 1, so saving with it (even
-    // without touching it) silently turns every "clean" track in the album into "explicit". Keep
-    // As-Is passes `nil` through to `onSave`, which the backend already treats as "leave each
-    // track's own rating untouched" — it just never had a way to be selected from this screen.
     private enum ExplicitRatingChoice: Int, CaseIterable {
         case keepAsIs = -1
         case none = 0

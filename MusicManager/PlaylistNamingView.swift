@@ -142,10 +142,6 @@ struct PlaylistNamingView: View {
         }
     }
 
-    /// Center-crops to a square in true pixel space (after normalizing EXIF orientation, so the
-    /// crop rect lines up with what's actually displayed) and downsizes large photos, since a
-    /// playlist cover only ever renders as a small square tile — there's no reason to upload a
-    /// multi-megabyte, non-square original to the device.
     private static func squareCroppedJPEGData(from data: Data, maxDimension: CGFloat = 1024) -> Data? {
         guard let original = UIImage(data: data) else { return nil }
 

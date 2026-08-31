@@ -43,11 +43,6 @@ struct DeviceLibraryBrowserView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var songs: [DeviceManager.ExportableSongInfo] = []
-    // Cached results of the grouping/sorting passes below. These are expensive (full-library
-    // Dictionary grouping + sort + Unicode folding), so they're recomputed only when the real
-    // inputs (songs, searchText) change via recomputeLibraryGroupings() — not on every SwiftUI
-    // body evaluation, which otherwise happens constantly during scrolling as artwork thumbnails
-    // load in and mutate unrelated @State.
     @State private var cachedGroupedSongs: [(key: String, songs: [DeviceManager.ExportableSongInfo])] = []
     @State private var cachedArtistEntries: [ArtistEntry] = []
     @State private var cachedAlbumEntries: [AlbumEntry] = []
@@ -152,9 +147,6 @@ struct DeviceLibraryBrowserView: View {
             }
     }
 
-    // Splits a collab credit like "Alex Rose & Casper Magico" into ["Alex Rose", "Casper Magico"]
-    // so each performer gets their own Artists row instead of one row per unique credit string.
-    // This intentionally causes the same song to show up under every artist it credits.
     static let artistSplitRegex = try! NSRegularExpression(
         pattern: #"\s*(?:,|&|/|\bfeat\.?|\bft\.?|\bfeaturing\b|\bvs\.?|\bx\b|\by\b)\s*"#,
         options: [.caseInsensitive]
@@ -194,10 +186,6 @@ struct DeviceLibraryBrowserView: View {
 
     private func computeAlbumEntries() -> [AlbumEntry] {
         Dictionary(grouping: filteredSongs) { song -> String in
-            // Group by the device's own album_pid so tracks with different individual
-            // (e.g. collab) credits still land in the same album, matching how Apple's
-            // Music app groups them. Only falls back to a name/artist key for legacy rows
-            // that somehow lack an album_pid link.
             if song.albumPid > 0 {
                 return "pid:\(song.albumPid)"
             }

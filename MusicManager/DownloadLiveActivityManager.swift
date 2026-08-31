@@ -104,9 +104,6 @@ private final class DownloadLiveActivityRuntime {
         outstandingUpdate?.cancel()
 
         Task {
-            // Cancelling doesn't stop a task already mid-`await applyUpdate(...)` —
-            // waiting for it here keeps a stale in-flight update from landing on the
-            // activity after we've already told it to end.
             await outstandingUpdate?.value
             lastState = state
             let activity = currentActivity ?? Activity<DownloadLiveActivityAttributes>.activities.first

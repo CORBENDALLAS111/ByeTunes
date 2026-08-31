@@ -357,13 +357,6 @@ struct LibraryRepairView: View {
                 }
 
                 Button {
-                    // Don't flip the `isFixing.../isRunning...` flags here — that's what drives
-                    // this popup's own visibility, so doing it in the same action that sets
-                    // "Cancelling..." made the popup disappear before that text ever rendered.
-                    // These blocking AFC/SQL operations can only notice cancellation between
-                    // steps, not mid-call, so leave the popup up with "Cancelling..." until each
-                    // operation's own completion handler actually confirms it stopped and clears
-                    // its own flag.
                     manager.cancelCurrentRepairOperation()
                     artworkFixMessage = "Cancelling..."
                 } label: {

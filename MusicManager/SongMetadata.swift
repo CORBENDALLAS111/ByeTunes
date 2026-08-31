@@ -104,9 +104,6 @@ struct SongMetadata: Identifiable {
         return !xid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Short codec label for display (FLAC/ALAC/AAC/MP3/...), read from the local file's actual
-    /// audio codec (`inspectLocalAudioCharacteristics`), not inferred from file extension. Falls
-    /// back to the file extension when the codec wasn't captured (e.g. `playbackCodecType == 0`).
     var audioFormatLabel: String {
         switch AudioFormatID(playbackCodecType) {
         case kAudioFormatAppleLossless: return "ALAC"
