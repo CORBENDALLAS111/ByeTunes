@@ -111,4 +111,4 @@ Found a bug? We'd love to fix it!
     *   Please attach these logs to your issue report—they help us solve problems much faster!
 
 ---
-*Created with ❤️ by EduAlexxis*
+*Created with ❤️ by EduAlexxis* 
